@@ -54,6 +54,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -i, --input PATH      Input image for img2img\n");
     fprintf(stderr, "  -t, --strength N      Strength 0.0-1.0 (default: %.2f)\n\n", DEFAULT_STRENGTH);
     fprintf(stderr, "Other options:\n");
+    fprintf(stderr, "  -e, --embeddings PATH Load text embeddings from binary file\n");
     fprintf(stderr, "  -v, --verbose         Enable verbose output\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
@@ -101,6 +102,8 @@ int main(int argc, char *argv[]) {
         {"seed",     required_argument, 0, 'S'},
         {"input",    required_argument, 0, 'i'},
         {"strength", required_argument, 0, 't'},
+        {"embeddings", required_argument, 0, 'e'},
+        {"noise",    required_argument, 0, 'n'},
         {"verbose",  no_argument,       0, 'v'},
         {"help",     no_argument,       0, 'h'},
         {"version",  no_argument,       0, 'V'},
@@ -113,6 +116,8 @@ int main(int argc, char *argv[]) {
     char *prompt = NULL;
     char *output_path = NULL;
     char *input_path = NULL;
+    char *embeddings_path = NULL;
+    char *noise_path = NULL;
 
     flux_params params = {
         .width = DEFAULT_WIDTH,
@@ -126,7 +131,7 @@ int main(int argc, char *argv[]) {
     int verbose = 0;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:d:p:o:W:H:s:g:S:i:t:vhV",
+    while ((opt = getopt_long(argc, argv, "m:d:p:o:W:H:s:g:S:i:t:e:n:vhV",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'm':
@@ -162,6 +167,12 @@ int main(int argc, char *argv[]) {
             case 't':
                 params.strength = atof(optarg);
                 break;
+            case 'e':
+                embeddings_path = optarg;
+                break;
+            case 'n':
+                noise_path = optarg;
+                break;
             case 'v':
                 verbose = 1;
                 break;
@@ -188,8 +199,8 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!prompt) {
-        fprintf(stderr, "Error: Prompt is required (-p)\n\n");
+    if (!prompt && !embeddings_path) {
+        fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -295,8 +306,97 @@ int main(int argc, char *argv[]) {
 
         output = flux_img2img(ctx, prompt, input, &params);
         flux_image_free(input);
+    } else if (embeddings_path) {
+        /* Text-to-image mode with external embeddings */
+        if (verbose) {
+            fprintf(stderr, "Loading embeddings from %s...\n", embeddings_path);
+        }
+
+        /* Load embeddings file */
+        FILE *emb_file = fopen(embeddings_path, "rb");
+        if (!emb_file) {
+            fprintf(stderr, "Error: Failed to open embeddings file: %s\n", embeddings_path);
+            flux_free(ctx);
+            return 1;
+        }
+
+        /* Get file size and compute dimensions */
+        fseek(emb_file, 0, SEEK_END);
+        long file_size = ftell(emb_file);
+        fseek(emb_file, 0, SEEK_SET);
+
+        /* Expected: [1, 512, 7680] = 512 * 7680 * 4 bytes = 15728640 bytes */
+        int text_dim = FLUX_TEXT_DIM;  /* 7680 */
+        int text_seq = file_size / (text_dim * sizeof(float));
+
+        if (verbose) {
+            fprintf(stderr, "Embeddings: %d tokens x %d dims (%.2f MB)\n",
+                    text_seq, text_dim, file_size / (1024.0 * 1024.0));
+        }
+
+        float *text_emb = (float *)malloc(file_size);
+        if (fread(text_emb, 1, file_size, emb_file) != (size_t)file_size) {
+            fprintf(stderr, "Error: Failed to read embeddings file\n");
+            free(text_emb);
+            fclose(emb_file);
+            flux_free(ctx);
+            return 1;
+        }
+        fclose(emb_file);
+
+        /* Load noise if provided */
+        float *noise = NULL;
+        int noise_size = 0;
+        if (noise_path) {
+            if (verbose) {
+                fprintf(stderr, "Loading noise from %s...\n", noise_path);
+            }
+
+            FILE *noise_file = fopen(noise_path, "rb");
+            if (!noise_file) {
+                fprintf(stderr, "Error: Failed to open noise file: %s\n", noise_path);
+                free(text_emb);
+                flux_free(ctx);
+                return 1;
+            }
+
+            fseek(noise_file, 0, SEEK_END);
+            long noise_file_size = ftell(noise_file);
+            fseek(noise_file, 0, SEEK_SET);
+
+            noise_size = noise_file_size / sizeof(float);
+            noise = (float *)malloc(noise_file_size);
+            if (fread(noise, 1, noise_file_size, noise_file) != (size_t)noise_file_size) {
+                fprintf(stderr, "Error: Failed to read noise file\n");
+                free(noise);
+                free(text_emb);
+                fclose(noise_file);
+                flux_free(ctx);
+                return 1;
+            }
+            fclose(noise_file);
+
+            if (verbose) {
+                fprintf(stderr, "Noise: %d floats (%.2f KB)\n",
+                        noise_size, noise_file_size / 1024.0);
+            }
+        }
+
+        if (verbose) {
+            fprintf(stderr, "Generating with external embeddings%s...\n",
+                    noise ? " and noise" : "");
+        }
+
+        if (noise) {
+            output = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
+                                                              noise, noise_size, &params);
+            free(noise);
+        } else {
+            output = flux_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+        }
+        free(text_emb);
     } else {
-        /* Text-to-image mode */
+        /* Text-to-image mode with internal text encoder */
         if (verbose) {
             fprintf(stderr, "Generating...\n");
         }

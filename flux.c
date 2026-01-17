@@ -431,6 +431,11 @@ void flux_free(flux_ctx *ctx) {
     free(ctx);
 }
 
+/* Get transformer for debugging */
+void *flux_get_transformer(flux_ctx *ctx) {
+    return ctx ? ctx->transformer : NULL;
+}
+
 /* ========================================================================
  * Text Encoding
  * ======================================================================== */
@@ -596,6 +601,198 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 
     free(latent);
 
+    return img;
+}
+
+/* ========================================================================
+ * Generation with Pre-computed Embeddings
+ * ======================================================================== */
+
+/* Forward declaration for official schedule */
+extern float *flux_official_schedule(int num_steps, int image_seq_len);
+
+flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
+                                           const float *text_emb, int text_seq,
+                                           const flux_params *params) {
+    if (!ctx || !text_emb) {
+        set_error("Invalid context or embeddings");
+        return NULL;
+    }
+
+    flux_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (flux_params)FLUX_PARAMS_DEFAULT;
+    }
+
+    /* Validate dimensions */
+    if (p.width <= 0) p.width = 512;
+    if (p.height <= 0) p.height = 512;
+    if (p.num_steps <= 0) p.num_steps = 4;
+    if (p.guidance_scale <= 0) p.guidance_scale = 1.0f;
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+
+    if (ctx->verbose) {
+        fprintf(stderr, "Generating %dx%d with external embeddings (%d tokens)\n",
+                p.width, p.height, text_seq);
+    }
+
+    /* Compute latent dimensions */
+    int latent_h = p.height / 16;
+    int latent_w = p.width / 16;
+    int image_seq_len = latent_h * latent_w;
+
+    /* Initialize noise */
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
+
+    /* Get official FLUX.2 schedule (matches Python) */
+    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+
+    if (ctx->verbose) {
+        fprintf(stderr, "Schedule: [");
+        for (int i = 0; i <= p.num_steps; i++) {
+            fprintf(stderr, "%.4f%s", schedule[i], i < p.num_steps ? ", " : "");
+        }
+        fprintf(stderr, "]\n");
+    }
+
+    /* Sample */
+    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
+    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+
+    float *latent = flux_sample_euler(
+        ctx->transformer, ctx->text_encoder,
+        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        text_emb, text_seq,
+        NULL,
+        schedule, p.num_steps,
+        p.guidance_scale,
+        progress
+    );
+
+    free(z);
+    free(schedule);
+
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Decode latent to image */
+    flux_image *img = NULL;
+    if (ctx->vae) {
+        img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    } else {
+        set_error("No VAE loaded");
+        free(latent);
+        return NULL;
+    }
+
+    free(latent);
+    return img;
+}
+
+/* Generate with external embeddings and external noise */
+flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
+                                                     const float *text_emb, int text_seq,
+                                                     const float *noise, int noise_size,
+                                                     const flux_params *params) {
+    if (!ctx || !text_emb || !noise) {
+        set_error("Invalid context, embeddings, or noise");
+        return NULL;
+    }
+
+    flux_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (flux_params)FLUX_PARAMS_DEFAULT;
+    }
+
+    /* Validate dimensions */
+    if (p.width <= 0) p.width = 512;
+    if (p.height <= 0) p.height = 512;
+    if (p.num_steps <= 0) p.num_steps = 4;
+    if (p.guidance_scale <= 0) p.guidance_scale = 1.0f;
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+
+    /* Compute latent dimensions */
+    int latent_h = p.height / 16;
+    int latent_w = p.width / 16;
+    int image_seq_len = latent_h * latent_w;
+    int expected_noise_size = FLUX_LATENT_CHANNELS * latent_h * latent_w;
+
+    if (noise_size != expected_noise_size) {
+        char err[256];
+        snprintf(err, sizeof(err), "Noise size mismatch: got %d, expected %d",
+                 noise_size, expected_noise_size);
+        set_error(err);
+        return NULL;
+    }
+
+    if (ctx->verbose) {
+        fprintf(stderr, "Generating %dx%d with external embeddings (%d tokens) and noise\n",
+                p.width, p.height, text_seq);
+    }
+
+    /* Copy external noise */
+    float *z = (float *)malloc(expected_noise_size * sizeof(float));
+    memcpy(z, noise, expected_noise_size * sizeof(float));
+
+    /* Get official FLUX.2 schedule (matches Python) */
+    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+
+    if (ctx->verbose) {
+        fprintf(stderr, "Schedule: [");
+        for (int i = 0; i <= p.num_steps; i++) {
+            fprintf(stderr, "%.4f%s", schedule[i], i < p.num_steps ? ", " : "");
+        }
+        fprintf(stderr, "]\n");
+    }
+
+    /* Sample */
+    void (*progress)(int, int) = ctx->verbose ? default_progress : NULL;
+    if (progress) clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+
+    float *latent = flux_sample_euler(
+        ctx->transformer, ctx->text_encoder,
+        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        text_emb, text_seq,
+        NULL,
+        schedule, p.num_steps,
+        p.guidance_scale,
+        progress
+    );
+
+    free(z);
+    free(schedule);
+
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Decode latent to image */
+    flux_image *img = NULL;
+    if (ctx->vae) {
+        img = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    } else {
+        set_error("No VAE loaded");
+        free(latent);
+        return NULL;
+    }
+
+    free(latent);
     return img;
 }
 

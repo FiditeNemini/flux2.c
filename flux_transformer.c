@@ -152,17 +152,19 @@ static void compute_rope_freqs(float *freqs, int max_seq, int dim, float theta) 
 
 /* Compute 2D RoPE frequencies for image tokens (h, w positions)
  * FLUX uses axes_dims_rope: [32, 32, 32, 32] = 128 total
- * - Dims 0-31: axis 0 (always 0 for images, cos=1, sin=0)
- * - Dims 32-63: axis 1 (always 0 for images, cos=1, sin=0)
- * - Dims 64-95: axis 2 = y/height position
- * - Dims 96-127: axis 3 = x/width position
+ * Position IDs format: (T, H, W, L) where:
+ * - Axis 0 (dims 0-31): T position (always 0 for images)
+ * - Axis 1 (dims 32-63): H position (y/height coordinate)
+ * - Axis 2 (dims 64-95): W position (x/width coordinate)
+ * - Axis 3 (dims 96-127): L position (always 0 for images)
  */
 static void compute_rope_2d(float *cos_out, float *sin_out,
                             int patch_h, int patch_w, int axis_dim, float theta) {
     int half_axis = axis_dim / 2;  /* 16 dims per half-axis */
     int seq = patch_h * patch_w;
+    (void)seq;  /* Unused but kept for documentation */
 
-    /* Precompute base frequencies for each axis (dims 0..15 of each 32-dim axis) */
+    /* Precompute base frequencies: omega = 1 / (theta^(2d/dim)) for d = 0..15 */
     float *base_freqs = (float *)malloc(half_axis * sizeof(float));
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
@@ -174,39 +176,43 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
             float *cos_p = cos_out + pos * axis_dim * 4;  /* 4 axes * 32 dims each = 128 */
             float *sin_p = sin_out + pos * axis_dim * 4;
 
-            /* Axis 0 (dims 0-31): position = 0, so cos=1, sin=0 */
+            /* Axis 0 (dims 0-31): T position = 0, so cos=1, sin=0 */
             for (int d = 0; d < axis_dim; d++) {
                 cos_p[d] = 1.0f;
                 sin_p[d] = 0.0f;
             }
 
-            /* Axis 1 (dims 32-63): position = 0, so cos=1, sin=0 */
+            /* Axis 1 (dims 32-63): H position (y/height)
+             * Python RoPE stacks [cos, -sin, sin, cos] as 2x2 matrix per freq.
+             * For apply_rope: out = [[cos, -sin], [sin, cos]] @ [x0, x1]
+             * We store cos/sin per pair and apply_rope_2d handles the rotation.
+             */
+            for (int d = 0; d < half_axis; d++) {
+                float angle_h = (float)hy * base_freqs[d];
+                float cos_h = cosf(angle_h);
+                float sin_h = sinf(angle_h);
+                /* Each frequency contributes to a pair of dimensions */
+                cos_p[axis_dim + d * 2] = cos_h;
+                cos_p[axis_dim + d * 2 + 1] = cos_h;
+                sin_p[axis_dim + d * 2] = sin_h;
+                sin_p[axis_dim + d * 2 + 1] = sin_h;
+            }
+
+            /* Axis 2 (dims 64-95): W position (x/width) */
+            for (int d = 0; d < half_axis; d++) {
+                float angle_w = (float)wx * base_freqs[d];
+                float cos_w = cosf(angle_w);
+                float sin_w = sinf(angle_w);
+                cos_p[axis_dim * 2 + d * 2] = cos_w;
+                cos_p[axis_dim * 2 + d * 2 + 1] = cos_w;
+                sin_p[axis_dim * 2 + d * 2] = sin_w;
+                sin_p[axis_dim * 2 + d * 2 + 1] = sin_w;
+            }
+
+            /* Axis 3 (dims 96-127): L position = 0, so cos=1, sin=0 */
             for (int d = 0; d < axis_dim; d++) {
-                cos_p[axis_dim + d] = 1.0f;
-                sin_p[axis_dim + d] = 0.0f;
-            }
-
-            /* Axis 2 (dims 64-95): y/height position
-             * Python uses repeat_interleave_real=True, so each freq is repeated twice */
-            for (int d = 0; d < half_axis; d++) {
-                float angle_y = (float)hy * base_freqs[d];
-                float cos_y = cosf(angle_y);
-                float sin_y = sinf(angle_y);
-                cos_p[axis_dim * 2 + d * 2] = cos_y;
-                cos_p[axis_dim * 2 + d * 2 + 1] = cos_y;
-                sin_p[axis_dim * 2 + d * 2] = sin_y;
-                sin_p[axis_dim * 2 + d * 2 + 1] = sin_y;
-            }
-
-            /* Axis 3 (dims 96-127): x/width position */
-            for (int d = 0; d < half_axis; d++) {
-                float angle_x = (float)wx * base_freqs[d];
-                float cos_x = cosf(angle_x);
-                float sin_x = sinf(angle_x);
-                cos_p[axis_dim * 3 + d * 2] = cos_x;
-                cos_p[axis_dim * 3 + d * 2 + 1] = cos_x;
-                sin_p[axis_dim * 3 + d * 2] = sin_x;
-                sin_p[axis_dim * 3 + d * 2 + 1] = sin_x;
+                cos_p[axis_dim * 3 + d] = 1.0f;
+                sin_p[axis_dim * 3 + d] = 0.0f;
             }
         }
     }
@@ -242,30 +248,43 @@ static void apply_rope_2d(float *x, const float *cos_freq, const float *sin_freq
     }
 }
 
-/* Apply 1D RoPE to text Q/K: standard positional encoding */
-static void apply_rope_1d(float *x, int seq, int heads, int head_dim,
-                          int axis_dim, int start_pos, float theta) {
-    int half_axis = axis_dim / 2;
+/* Compute text RoPE frequencies for axis 3 (L dimension)
+ * Text tokens have position IDs (T=0, H=0, W=0, L=seq_idx) where L = 0..seq-1
+ * So axes 0-2 are identity, and axis 3 has the sequence position
+ */
+static void compute_rope_text(float *cos_out, float *sin_out,
+                              int txt_seq, int axis_dim, float theta) {
+    int half_axis = axis_dim / 2;  /* 16 */
+    int head_dim = axis_dim * 4;   /* 128 */
 
-    for (int s = 0; s < seq; s++) {
-        int pos = start_pos + s;
-        for (int h = 0; h < heads; h++) {
-            float *vec = x + (s * heads + h) * head_dim;
+    /* Precompute base frequencies */
+    float *base_freqs = (float *)malloc(half_axis * sizeof(float));
+    for (int d = 0; d < half_axis; d++) {
+        base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
+    }
 
-            /* Apply rotation to dims 64-95 (third axis for text position) */
-            for (int d = 0; d < half_axis; d++) {
-                float freq = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
-                float angle = (float)pos * freq;
-                float cos_val = cosf(angle);
-                float sin_val = sinf(angle);
+    for (int s = 0; s < txt_seq; s++) {
+        float *cos_p = cos_out + s * head_dim;  /* 128 dims */
+        float *sin_p = sin_out + s * head_dim;
 
-                float x0 = vec[axis_dim * 2 + d];
-                float x1 = vec[axis_dim * 2 + d + half_axis];
-                vec[axis_dim * 2 + d] = x0 * cos_val - x1 * sin_val;
-                vec[axis_dim * 2 + d + half_axis] = x0 * sin_val + x1 * cos_val;
-            }
+        /* Axes 0, 1, 2 (dims 0-95): T=H=W=0, so identity */
+        for (int d = 0; d < axis_dim * 3; d++) {
+            cos_p[d] = 1.0f;
+            sin_p[d] = 0.0f;
+        }
+
+        /* Axis 3 (dims 96-127): L position = s (sequence index) */
+        for (int d = 0; d < half_axis; d++) {
+            float angle = (float)s * base_freqs[d];
+            float cos_l = cosf(angle);
+            float sin_l = sinf(angle);
+            cos_p[axis_dim * 3 + d * 2] = cos_l;
+            cos_p[axis_dim * 3 + d * 2 + 1] = cos_l;
+            sin_p[axis_dim * 3 + d * 2] = sin_l;
+            sin_p[axis_dim * 3 + d * 2 + 1] = sin_l;
         }
     }
+    free(base_freqs);
 }
 
 /* Legacy apply_rope for backward compatibility (not used) */
@@ -484,19 +503,22 @@ static void joint_attention(float *img_out, float *txt_out,
     int total_seq = img_seq + txt_seq;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* Concatenate K, V from both streams */
+    /* Concatenate K, V from both streams
+     * IMPORTANT: Python (official Flux2) concatenates as [TEXT, IMAGE]
+     * so text comes first, then image. We must match this order.
+     */
     float *cat_k = (float *)malloc(total_seq * heads * head_dim * sizeof(float));
     float *cat_v = (float *)malloc(total_seq * heads * head_dim * sizeof(float));
 
-    /* Copy image K, V */
-    memcpy(cat_k, img_k, img_seq * heads * head_dim * sizeof(float));
-    memcpy(cat_v, img_v, img_seq * heads * head_dim * sizeof(float));
+    /* Copy text K, V first (at offset 0) */
+    memcpy(cat_k, txt_k, txt_seq * heads * head_dim * sizeof(float));
+    memcpy(cat_v, txt_v, txt_seq * heads * head_dim * sizeof(float));
 
-    /* Copy text K, V */
-    memcpy(cat_k + img_seq * heads * head_dim, txt_k,
-           txt_seq * heads * head_dim * sizeof(float));
-    memcpy(cat_v + img_seq * heads * head_dim, txt_v,
-           txt_seq * heads * head_dim * sizeof(float));
+    /* Copy image K, V after text (at offset txt_seq) */
+    memcpy(cat_k + txt_seq * heads * head_dim, img_k,
+           img_seq * heads * head_dim * sizeof(float));
+    memcpy(cat_v + txt_seq * heads * head_dim, img_v,
+           img_seq * heads * head_dim * sizeof(float));
 
     float *scores = (float *)malloc(total_seq * total_seq * sizeof(float));
 
@@ -515,6 +537,16 @@ static void joint_attention(float *img_out, float *txt_out,
             }
         }
 
+#ifdef DEBUG_ATTENTION
+        if (h == 0) {
+            fprintf(stderr, "[ATTN] Image query 0, head 0 scores:\n");
+            fprintf(stderr, "  first 5 txt keys: ");
+            for (int j = 0; j < 5; j++) fprintf(stderr, "%.6f ", scores[j]);
+            fprintf(stderr, "\n  first 5 img keys (pos %d): ", txt_seq);
+            for (int j = txt_seq; j < txt_seq + 5; j++) fprintf(stderr, "%.6f ", scores[j]);
+            fprintf(stderr, "\n");
+        }
+#endif
         /* Softmax for image queries */
         flux_softmax(scores, img_seq, total_seq);
 
@@ -601,7 +633,8 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                                  const float *t_emb,
                                  const float *img_adaln_weight,
                                  const float *txt_adaln_weight,
-                                 const float *rope_cos, const float *rope_sin,
+                                 const float *img_rope_cos, const float *img_rope_sin,
+                                 const float *txt_rope_cos, const float *txt_rope_sin,
                                  int img_seq, int txt_seq,
                                  flux_transformer_t *tf) {
     int hidden = tf->hidden_size;
@@ -652,6 +685,19 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     float *img_norm = tf->work1;
     apply_adaln(img_norm, img_hidden, img_shift1, img_scale1, img_seq, hidden, eps);
 
+#ifdef DEBUG_DOUBLE_BLOCK
+    static int block_idx = 0;
+    if (block_idx == 0) {
+        fprintf(stderr, "\n[DBL] img_mod[0,:10] (shift1): ");
+        for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", img_shift1[i]);
+        fprintf(stderr, "\n[DBL] img_mod[0,3072:3082] (scale1): ");
+        for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", img_scale1[i]);
+        fprintf(stderr, "\n[DBL] After AdaLN img_norm[0,0,:10]: ");
+        for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", img_norm[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     /* Separate Q, K, V projections (fixes interleaved output bug) */
     float *img_q = tf->work2;
     float *img_k = img_q + img_seq * hidden;
@@ -667,8 +713,18 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 
     /* Apply 2D RoPE to image Q, K (using h, w positions) */
     int axis_dim = 32;
-    apply_rope_2d(img_q, rope_cos, rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k, rope_cos, rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] After Q proj img_q[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_q[i]);
+        fprintf(stderr, "\n[DBL] After RoPE img_q[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_q[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
 
     /* Text stream: AdaLN -> QKV -> QK-norm -> RoPE */
     float *txt_norm = img_norm + img_seq * hidden;
@@ -687,9 +743,11 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     apply_qk_norm(txt_q, txt_k, block->txt_norm_q_weight, block->txt_norm_k_weight,
                   txt_seq, heads, head_dim, eps);
 
-    /* Note: In FLUX.2, text tokens have txt_ids = [0, 0, 0, 0] (all zeros)
-     * This means text RoPE should be identity - no rotation applied.
+    /* Apply text RoPE - text tokens have position IDs (0, 0, 0, L) where L is sequence index
+     * This applies rotation in axis 3 (dims 96-127)
      */
+    apply_rope_2d(txt_q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(txt_k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
 
     /* Joint attention */
     float *img_attn_out = (float *)malloc(img_seq * hidden * sizeof(float));
@@ -700,6 +758,14 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
                     txt_q, txt_k, txt_v,
                     img_seq, txt_seq, heads, head_dim);
 
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] After attn img_attn_out[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_attn_out[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     /* Project attention output */
     float *img_proj = tf->work1;
     float *txt_proj = img_proj + img_seq * hidden;
@@ -709,6 +775,17 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     flux_linear_nobias(txt_proj, txt_attn_out, block->txt_proj_weight,
                        txt_seq, hidden, hidden);
 
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] After proj img_proj[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_proj[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[DBL] gate1[0:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_gate1[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     /* Apply gate and add residual */
     for (int i = 0; i < img_seq * hidden; i++) {
         img_hidden[i] += img_gate1[i % hidden] * img_proj[i];
@@ -717,15 +794,50 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
         txt_hidden[i] += txt_gate1[i % hidden] * txt_proj[i];
     }
 
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] After attn residual img_hidden[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_hidden[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     /* FFN for image */
     apply_adaln(img_norm, img_hidden, img_shift2, img_scale2, img_seq, hidden, eps);
+
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] FFN input (after AdaLN) img_norm[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_norm[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     swiglu_ffn(img_proj, img_norm,
                block->img_mlp_gate_weight, block->img_mlp_up_weight,
                block->img_mlp_down_weight,
                img_seq, hidden, mlp_hidden);
+
+#ifdef DEBUG_DOUBLE_BLOCK
+    if (block_idx == 0) {
+        fprintf(stderr, "[DBL] FFN output img_proj[0,0,:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_proj[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[DBL] gate2[0:5]: ");
+        for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_gate2[i]);
+        fprintf(stderr, "\n");
+    }
+#endif
+
     for (int i = 0; i < img_seq * hidden; i++) {
         img_hidden[i] += img_gate2[i % hidden] * img_proj[i];
     }
+
+#ifdef DEBUG_DOUBLE_BLOCK
+    fprintf(stderr, "[DBL%d] After FFN residual img_hidden[0,0,:5]: ", block_idx);
+    for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_hidden[i]);
+    fprintf(stderr, "\n");
+#endif
 
     /* FFN for text */
     apply_adaln(txt_norm, txt_hidden, txt_shift2, txt_scale2, txt_seq, hidden, eps);
@@ -741,6 +853,10 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
     free(txt_mod);
     free(img_attn_out);
     free(txt_attn_out);
+
+#ifdef DEBUG_DOUBLE_BLOCK
+    block_idx++;
+#endif
 }
 
 /* ========================================================================
@@ -749,7 +865,8 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
 
 static void single_block_forward(float *hidden, const single_block_t *block,
                                  const float *t_emb, const float *adaln_weight,
-                                 const float *rope_cos, const float *rope_sin,
+                                 const float *img_rope_cos, const float *img_rope_sin,
+                                 const float *txt_rope_cos, const float *txt_rope_sin,
                                  int seq, int img_offset, flux_transformer_t *tf) {
     /* seq = total_seq (txt + img)
      * img_offset = txt_seq (where image starts in the [txt, img] concatenation)
@@ -819,18 +936,21 @@ static void single_block_forward(float *hidden, const single_block_t *block,
                   seq, heads, head_dim, eps);
 
     /* Apply RoPE: layout is [txt, img]
-     * - Text portion (0 to img_offset-1): identity RoPE (no rotation)
-     * - Image portion (img_offset to seq-1): 2D RoPE based on positions
+     * - Text portion (0 to img_offset-1): RoPE in axis 3 (L dimension)
+     * - Image portion (img_offset to seq-1): 2D RoPE based on H/W positions
      */
     int axis_dim = 32;
+    int txt_seq = img_offset;
+
+    /* Text portion: apply RoPE in axis 3 (L dimension = sequence position) */
+    apply_rope_2d(q, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(k, txt_rope_cos, txt_rope_sin, txt_seq, heads, head_dim, axis_dim);
 
     /* Image portion: apply 2D RoPE starting at img_offset */
     float *img_q = q + img_offset * h_size;
     float *img_k = k + img_offset * h_size;
-    apply_rope_2d(img_q, rope_cos, rope_sin, img_seq, heads, head_dim, axis_dim);
-    apply_rope_2d(img_k, rope_cos, rope_sin, img_seq, heads, head_dim, axis_dim);
-
-    /* Text portion: identity RoPE (no rotation needed) */
+    apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
+    apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
     /* Self-attention */
     float *attn_out = (float *)malloc(seq * h_size * sizeof(float));
@@ -898,9 +1018,16 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
      */
     /* Allocate RoPE: 4 axes * 32 dims = 128 dims per position (matches head_dim) */
-    float *rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    compute_rope_2d(rope_cos, rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
+    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
+    compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+
+    /* Compute text RoPE frequencies - text tokens have position IDs (0, 0, 0, L)
+     * where L is the sequence index. RoPE is applied in axis 3 (dims 96-127)
+     */
+    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
 
     /* Transpose input from NCHW [channels, h, w] to NLC [seq, channels] format
      * Input: img_latent[c * img_seq + pos] for channel c at position pos
@@ -925,6 +1052,29 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     flux_linear_nobias(txt_hidden, txt_emb, tf->txt_in_weight,
                        txt_seq, tf->text_dim, hidden);
 
+#ifdef DEBUG_TRANSFORMER
+    /* Debug: print intermediate values for comparison with Python */
+    fprintf(stderr, "\n[DEBUG] t_emb first 10: ");
+    for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", t_emb[i]);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[DEBUG] img_hidden[0,0,:5] (img_proj): ");
+    for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", img_hidden[i]);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[DEBUG] txt_hidden[0,0,:5] (txt_proj): ");
+    for (int i = 0; i < 5; i++) fprintf(stderr, "%.6f ", txt_hidden[i]);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[DEBUG] img_rope_cos[0, :10]: ");
+    for (int i = 0; i < 10; i++) fprintf(stderr, "%.6f ", img_rope_cos[i]);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[DEBUG] txt_rope_cos[10, 96:106]: ");
+    for (int i = 96; i < 106; i++) fprintf(stderr, "%.6f ", txt_rope_cos[10 * head_dim + i]);
+    fprintf(stderr, "\n");
+#endif
+
     /* Double-stream blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         double_block_forward(img_hidden, txt_hidden,
@@ -932,8 +1082,25 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              t_emb,
                              tf->adaln_double_img_weight,
                              tf->adaln_double_txt_weight,
-                             rope_cos, rope_sin,
+                             img_rope_cos, img_rope_sin,
+                             txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
+#ifdef DEBUG_TRANSFORMER
+        if (i == 0) {
+            fprintf(stderr, "\n[DEBUG] After double block 0:\n");
+            fprintf(stderr, "[DEBUG] img_hidden[0,0,:10]: ");
+            for (int d = 0; d < 10; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
+            fprintf(stderr, "\n");
+            float sum = 0, sum_sq = 0;
+            for (int d = 0; d < img_seq * hidden; d++) {
+                sum += img_hidden[d];
+                sum_sq += img_hidden[d] * img_hidden[d];
+            }
+            float mean = sum / (img_seq * hidden);
+            float std = sqrtf(sum_sq / (img_seq * hidden) - mean * mean);
+            fprintf(stderr, "[DEBUG] img_hidden mean=%.6f, std=%.6f\n", mean, std);
+        }
+#endif
     }
 
     /* Concatenate text and image for single-stream blocks
@@ -949,13 +1116,30 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     for (int i = 0; i < tf->num_single_layers; i++) {
         single_block_forward(concat_hidden, &tf->single_blocks[i],
                              t_emb, tf->adaln_single_weight,
-                             rope_cos, rope_sin,
+                             img_rope_cos, img_rope_sin,
+                             txt_rope_cos, txt_rope_sin,
                              total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
+
+#ifdef DEBUG_SINGLE_BLOCK
+        if (i == 0 || i == 9 || i == 19) {
+            /* Print image portion (starts at txt_seq offset) */
+            float *img_part = concat_hidden + txt_seq * hidden;
+            fprintf(stderr, "[SGL%d] img_hidden[0,0,:5]: ", i);
+            for (int d = 0; d < 5; d++) fprintf(stderr, "%.6f ", img_part[d]);
+            fprintf(stderr, "\n");
+        }
+#endif
     }
 
     /* Extract image hidden states (image is after text) */
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
     free(concat_hidden);
+
+#ifdef DEBUG_FINAL_LAYER
+    fprintf(stderr, "[FINAL] Before final layer img_hidden[0,0,:5]: ");
+    for (int d = 0; d < 5; d++) fprintf(stderr, "%.6f ", img_hidden[d]);
+    fprintf(stderr, "\n");
+#endif
 
     /* Final layer: AdaLN modulation -> project to latent channels
      * norm_out.linear.weight is [6144, 3072] = [shift, scale] projection
@@ -971,7 +1155,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     flux_linear_nobias(final_mod, t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
     free(t_emb_silu);
 
-    /* Python: scale, shift = chunk(emb, 2) - scale is first half, shift is second half */
+    /* Python: scale, shift = mod.chunk(2, dim=1) - scale is first half, shift is second half */
     float *final_scale = final_mod;
     float *final_shift = final_mod + hidden;
 
@@ -996,8 +1180,10 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     free(output_nlc);
 
     free(t_emb);
-    free(rope_cos);
-    free(rope_sin);
+    free(img_rope_cos);
+    free(img_rope_sin);
+    free(txt_rope_cos);
+    free(txt_rope_sin);
 
     return output;
 }

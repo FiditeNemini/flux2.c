@@ -134,6 +134,26 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                           const flux_image **refs, int num_refs,
                           const flux_params *params);
 
+/*
+ * Text-to-image generation with pre-computed embeddings.
+ * text_emb: float array of shape [text_seq, FLUX_TEXT_DIM]
+ * text_seq: number of text tokens (typically 512)
+ */
+flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
+                                           const float *text_emb, int text_seq,
+                                           const flux_params *params);
+
+/*
+ * Generate image with external embeddings and external noise.
+ * For testing and debugging to match Python exactly.
+ * noise: [latent_channels, height/16, width/16] in NCHW format
+ * noise_size: total number of floats in noise array
+ */
+flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
+                                                     const float *text_emb, int text_seq,
+                                                     const float *noise, int noise_size,
+                                                     const flux_params *params);
+
 /* ========================================================================
  * Image I/O
  * ======================================================================== */

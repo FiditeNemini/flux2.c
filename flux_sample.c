@@ -75,6 +75,45 @@ float *flux_resolution_schedule(int num_steps, int height, int width) {
     return schedule;
 }
 
+/*
+ * FLUX.2 official schedule with empirical mu calculation
+ * Matches Python's get_schedule() function from official flux2 code
+ */
+static float compute_empirical_mu(int image_seq_len, int num_steps) {
+    const float a1 = 8.73809524e-05f, b1 = 1.89833333f;
+    const float a2 = 0.00016927f, b2 = 0.45666666f;
+
+    if (image_seq_len > 4300) {
+        return a2 * image_seq_len + b2;
+    }
+
+    float m_200 = a2 * image_seq_len + b2;
+    float m_10 = a1 * image_seq_len + b1;
+
+    float a = (m_200 - m_10) / 190.0f;
+    float b = m_200 - 200.0f * a;
+    return a * num_steps + b;
+}
+
+static float generalized_time_snr_shift(float t, float mu, float sigma) {
+    /* t / (1 - t) with exp(mu) shift */
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return expf(mu) / (expf(mu) + powf(1.0f / t - 1.0f, sigma));
+}
+
+float *flux_official_schedule(int num_steps, int image_seq_len) {
+    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    float mu = compute_empirical_mu(image_seq_len, num_steps);
+
+    for (int i = 0; i <= num_steps; i++) {
+        float t = 1.0f - (float)i / (float)num_steps;  /* Linear from 1 to 0 */
+        schedule[i] = generalized_time_snr_shift(t, mu, 1.0f);
+    }
+
+    return schedule;
+}
+
 /* ========================================================================
  * Euler Sampler for Rectified Flow
  * ======================================================================== */
