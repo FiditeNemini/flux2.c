@@ -329,6 +329,7 @@ void flux_linear_nobias(float *y, const float *x, const float *W,
  * Convolution Operations
  * ======================================================================== */
 
+#ifdef USE_BLAS
 /* im2col: Extract patches from input image into columns for BLAS matmul */
 static void im2col(const float *in, float *col,
                    int in_ch, int H, int W,
@@ -355,6 +356,7 @@ static void im2col(const float *in, float *col,
         }
     }
 }
+#endif /* USE_BLAS */
 
 void flux_conv2d(float *out, const float *in, const float *weight, const float *bias,
                  int batch, int in_ch, int out_ch, int H, int W,

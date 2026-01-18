@@ -75,22 +75,18 @@ static int byte_encoder_initialized = 0;
 static void init_byte_encoder(void) {
     if (byte_encoder_initialized) return;
 
-    int n = 0;
     /* Printable ASCII and extended Latin */
     for (int i = 33; i <= 126; i++) {
         byte_to_unicode[i] = i;
         unicode_to_byte[i] = i;
-        n++;
     }
     for (int i = 161; i <= 172; i++) {
         byte_to_unicode[i] = i;
         unicode_to_byte[i] = i;
-        n++;
     }
     for (int i = 174; i <= 255; i++) {
         byte_to_unicode[i] = i;
         unicode_to_byte[i] = i;
-        n++;
     }
 
     /* Map remaining bytes to 256+ range */
@@ -126,31 +122,6 @@ static int encode_byte_to_utf8(unsigned char b, char *out) {
     return 1;
 }
 
-/* Decode a UTF-8 character to its original byte */
-static int decode_utf8_to_byte(const char *s, int *len) {
-    init_byte_encoder();
-    unsigned char c0 = (unsigned char)s[0];
-    int cp;
-
-    if ((c0 & 0x80) == 0) {
-        *len = 1;
-        cp = c0;
-    } else if ((c0 & 0xE0) == 0xC0) {
-        *len = 2;
-        cp = ((c0 & 0x1F) << 6) | (s[1] & 0x3F);
-    } else if ((c0 & 0xF0) == 0xE0) {
-        *len = 3;
-        cp = ((c0 & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-    } else {
-        *len = 1;
-        return c0;  /* Fallback */
-    }
-
-    if (cp < 512 && unicode_to_byte[cp] != 0) {
-        return unicode_to_byte[cp];
-    }
-    return cp < 256 ? cp : '?';
-}
 
 /* ========================================================================
  * Hash Functions
@@ -564,7 +535,6 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
             while (*p && *p != ']') {
                 if (*p == '{') {
                     /* Parse added token object */
-                    const char *obj_start = p;
                     p++;
                     char *content = NULL;
                     int id = -1;
