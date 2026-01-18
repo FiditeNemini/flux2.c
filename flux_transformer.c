@@ -1486,7 +1486,7 @@ void flux_transformer_free(flux_transformer_t *tf) {
 static float *get_sf_tensor_tf(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) {
-        fprintf(stderr, "Warning: tensor %s not found\n", name);
+        fprintf(stderr, "Error: required tensor %s not found\n", name);
         return NULL;
     }
     return safetensors_get_f32(sf, t);

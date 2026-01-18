@@ -804,7 +804,7 @@ float *flux_image_to_tensor(const flux_image *img) {
 static float *get_sf_tensor(safetensors_file_t *sf, const char *name) {
     const safetensor_t *t = safetensors_find(sf, name);
     if (!t) {
-        fprintf(stderr, "Warning: tensor %s not found\n", name);
+        fprintf(stderr, "Error: required tensor %s not found\n", name);
         return NULL;
     }
     return safetensors_get_f32(sf, t);
@@ -847,7 +847,11 @@ static int load_resblock_sf(safetensors_file_t *sf, vae_resblock_t *block,
         block->skip_bias = NULL;
     }
 
-    return block->norm1_weight && block->conv1_weight && block->conv2_weight;
+    /* Check required tensors */
+    if (!block->norm1_weight || !block->conv1_weight || !block->conv2_weight) {
+        return -1;
+    }
+    return 0;
 }
 
 static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
@@ -881,7 +885,11 @@ static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
     snprintf(name, sizeof(name), "%s.to_out.0.bias", prefix);
     block->out_bias = get_sf_tensor(sf, name);
 
-    return block->norm_weight && block->q_weight && block->out_weight;
+    /* Check required tensors */
+    if (!block->norm_weight || !block->q_weight || !block->out_weight) {
+        return -1;
+    }
+    return 0;
 }
 
 flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf) {

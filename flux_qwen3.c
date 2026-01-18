@@ -471,7 +471,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
             return safetensors_get_f32(files[f], t);
         }
     }
-    fprintf(stderr, "Warning: tensor not found: %s\n", name);
+    fprintf(stderr, "Error: required tensor not found: %s\n", name);
     return NULL;
 }
 
@@ -517,6 +517,16 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer_idx);
     layer->mlp.down_proj_weight = load_tensor(files, num_files, name);
 
+    /* Check that all required tensors were loaded */
+    if (!layer->input_layernorm_weight || !layer->post_attention_layernorm_weight ||
+        !layer->attn.q_proj_weight || !layer->attn.k_proj_weight ||
+        !layer->attn.v_proj_weight || !layer->attn.o_proj_weight ||
+        !layer->attn.q_norm_weight || !layer->attn.k_norm_weight ||
+        !layer->mlp.gate_proj_weight || !layer->mlp.up_proj_weight ||
+        !layer->mlp.down_proj_weight) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -559,11 +569,18 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
 
     /* Load layer weights */
     for (int i = 0; i < model->num_layers; i++) {
-        load_layer_weights(&model->layers[i], files, 2, i);
+        if (load_layer_weights(&model->layers[i], files, 2, i) != 0) {
+            fprintf(stderr, "qwen3_model_load: failed to load layer %d\n", i);
+            goto error;
+        }
     }
 
     /* Load final norm */
     model->norm_weight = load_tensor(files, 2, "model.norm.weight");
+    if (!model->norm_weight) {
+        fprintf(stderr, "qwen3_model_load: failed to load final norm\n");
+        goto error;
+    }
 
     safetensors_close(files[0]);
     safetensors_close(files[1]);
