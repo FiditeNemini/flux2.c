@@ -30,10 +30,9 @@
 #include "flux_metal.h"
 #endif
 
-/* Minimum matrix size to use GPU - set very high to use BLAS for text encoder.
- * Text encoder runs 36 layers with many small-ish matmuls where GPU sync
- * overhead dominates. BLAS is actually faster for this workload. */
-#define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
+/* Minimum matrix size for GPU - FFN projections are ~3.5M elements and benefit
+ * from GPU acceleration. Smaller projections use BLAS to avoid sync overhead. */
+#define QWEN3_MIN_GPU_ELEMENTS (1 * 1024 * 1024)
 
 /* ========================================================================
  * Data Structures
