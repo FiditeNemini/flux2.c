@@ -78,8 +78,8 @@ struct flux_image {
  * ======================================================================== */
 
 typedef struct {
-    int width;              /* Output width (default: 1024) */
-    int height;             /* Output height (default: 1024) */
+    int width;              /* Output width (default: 256) */
+    int height;             /* Output height (default: 256) */
     int num_steps;          /* Inference steps (default: 4 for klein) */
     float guidance_scale;   /* CFG scale (default: 1.0 for klein) */
     int64_t seed;           /* Random seed (-1 for random) */

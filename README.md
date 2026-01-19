@@ -79,6 +79,7 @@ The `-t` (strength) parameter controls how much the image changes:
 -W, --width N         Output width in pixels (default: 256)
 -H, --height N        Output height in pixels (default: 256)
 -s, --steps N         Sampling steps (default: 4)
+-g, --guidance N      Guidance scale (default: 1.0)
 -S, --seed N          Random seed for reproducibility
 ```
 
@@ -242,7 +243,7 @@ Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image.
 
 **Notes:**
 - All times measured with `time` command (wall clock), including model loading, no warmup.
-- The C implementation uses float32 throughout, while PyTorch uses bfloat16 with highly optimized MPS kernels.
+- The C MPS implementation uses bf16 weights on GPU. The C BLAS implementation uses float32 throughout.
 - PyTorch benefits from keeping activations on GPU between operations; the C implementation currently transfers data between CPU and GPU for each operation.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 
@@ -412,6 +413,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt, const flux_image *in
 ```c
 flux_image *flux_image_load(const char *path);     /* Load PNG or PPM */
 int flux_image_save(const flux_image *img, const char *path);  /* 0=success, -1=error */
+int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);  /* Save with metadata */
 flux_image *flux_image_resize(const flux_image *img, int new_w, int new_h);
 void flux_image_free(flux_image *img);
 ```
