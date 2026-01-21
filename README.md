@@ -249,26 +249,21 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on syst
 
 Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image.
 
+At this point the MPS inference of this project is rougly as fast as the PyTorch higly optimized implementation for MPS using the official Flux.2 pipeline. The difference in time is mostly due to the fact that the weights loading code is not as optimized as it could.
+
 **Important:** Previous benchmarks in this README were misleading - they compared C timings (which included model loading) against reference timings (which excluded loading and used warmup runs). The table below shows fair "cold start" benchmarks where all implementations include model loading time and no warmup:
 
-| Size | C (MPS) | C (BLAS) | Reference (MPS) |
+| Size | C (MPS) | C (BLAS) | PyTorch (MPS) |
 |------|---------|----------|---------------|
-| 256x256 | 23s | 24s | 11s |
-| 512x512 | 26s | 44s | 13s |
-
-**Denoising-only times** (excluding model loading, for batch generation):
-
-| Size | C (MPS) Denoising |
-|------|-------------------|
-| 256x256 | 4.0s |
-| 512x512 | 3.2s |
+| 256x256 | 23s | 16s | 11s |
+| 512x512 | 18s | 46s | 13s |
+| 1024x1024 | 32s | 173s | 25s |
 
 **Notes:**
-- All times measured with `time` command (wall clock), including model loading, no warmup.
-- The C MPS implementation uses bf16 weights on GPU with optimized batch processing. The C BLAS implementation uses float32 throughout.
-- The reference implementation benefits from keeping activations on GPU between operations; the C implementation currently transfers data between CPU and GPU for each operation.
-- For batch generation (multiple images), only the denoising time matters after the first image. The MPS backend achieves ~4s per image at 256x256.
-- The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
+- All times measured as wall clock, including model loading, no warmup. The Python script is measured NOT including the huge time it takes to import the libraries, to be as fair as possible.
+- The C MPS implementation uses bf16 weights on GPU with optimized batch processing. The C BLAS implementation uses float32 throughout. The C BLAS optimization can be faster with `--mmap` since it avoids the costly loading process.
+- For batch generation (multiple images), only the denoising time matters after the first image. The MPS backend is competitive with the PyTorch engine.
+- The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks. It can be used just for fun if you don't have any other way to run it.
 
 ### Resolution Limits
 
