@@ -63,6 +63,21 @@ extern float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
                                           const float *text_emb, int text_seq,
                                           const float *schedule, int num_steps,
                                           void (*progress_callback)(int step, int total));
+
+/* Multi-reference support */
+typedef struct {
+    const float *latent;
+    int h, w;
+    int t_offset;
+} flux_ref_t;
+
+extern float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
+                                                float *z, int batch, int channels, int h, int w,
+                                                const flux_ref_t *refs, int num_refs,
+                                                const float *text_emb, int text_seq,
+                                                const float *schedule, int num_steps,
+                                                void (*progress_callback)(int step, int total));
+
 extern float *flux_linear_schedule(int num_steps);
 extern float *flux_official_schedule(int num_steps, int image_seq_len);
 extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
@@ -693,11 +708,170 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                           const flux_image **refs, int num_refs,
                           const flux_params *params) {
-    /* For now, just use the first reference if available */
-    if (refs && num_refs > 0) {
+    if (!ctx || !prompt) {
+        set_error("Invalid parameters");
+        return NULL;
+    }
+
+    /* No references - text-to-image */
+    if (!refs || num_refs == 0) {
+        return flux_generate(ctx, prompt, params);
+    }
+
+    /* Single reference - use optimized path */
+    if (num_refs == 1) {
         return flux_img2img(ctx, prompt, refs[0], params);
     }
-    return flux_generate(ctx, prompt, params);
+
+    flux_params p;
+    if (params) {
+        p = *params;
+    } else {
+        p = (flux_params)FLUX_PARAMS_DEFAULT;
+    }
+
+    /* Use first reference dimensions if not specified */
+    if (p.width <= 0) p.width = refs[0]->width;
+    if (p.height <= 0) p.height = refs[0]->height;
+
+    /* Clamp to VAE max dimensions */
+    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
+        float scale = (float)FLUX_VAE_MAX_DIM /
+                      (p.width > p.height ? p.width : p.height);
+        p.width = (int)(p.width * scale);
+        p.height = (int)(p.height * scale);
+    }
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+
+    /* Encode text */
+    int text_seq;
+    float *text_emb = flux_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+
+    flux_release_text_encoder(ctx);
+
+    if (!flux_load_transformer_if_needed(ctx)) {
+        free(text_emb);
+        return NULL;
+    }
+
+    /* Encode all reference images at their native sizes */
+    flux_ref_t *ref_latents = (flux_ref_t *)malloc(num_refs * sizeof(flux_ref_t));
+    float **ref_data = (float **)malloc(num_refs * sizeof(float *));
+    flux_image **resized_imgs = (flux_image **)calloc(num_refs, sizeof(flux_image *));
+
+    for (int i = 0; i < num_refs; i++) {
+        const flux_image *ref = refs[i];
+        const flux_image *img_to_use = ref;
+
+        /* Compute native size rounded to multiple of 16 */
+        int ref_w = (ref->width / 16) * 16;
+        int ref_h = (ref->height / 16) * 16;
+
+        /* Clamp to VAE max */
+        if (ref_w > FLUX_VAE_MAX_DIM) ref_w = FLUX_VAE_MAX_DIM;
+        if (ref_h > FLUX_VAE_MAX_DIM) ref_h = FLUX_VAE_MAX_DIM;
+
+        /* Resize only if dimensions changed after rounding/clamping */
+        if (ref->width != ref_w || ref->height != ref_h) {
+            resized_imgs[i] = flux_image_resize(ref, ref_w, ref_h);
+            if (!resized_imgs[i]) {
+                for (int j = 0; j < i; j++) {
+                    free(ref_data[j]);
+                    if (resized_imgs[j]) flux_image_free(resized_imgs[j]);
+                }
+                free(ref_latents);
+                free(ref_data);
+                free(resized_imgs);
+                free(text_emb);
+                set_error("Failed to resize reference image");
+                return NULL;
+            }
+            img_to_use = resized_imgs[i];
+        }
+
+        /* Encode to latent at reference's own size */
+        float *tensor = flux_image_to_tensor(img_to_use);
+        int lat_h, lat_w;
+        ref_data[i] = flux_vae_encode(ctx->vae, tensor, 1,
+                                       img_to_use->height, img_to_use->width,
+                                       &lat_h, &lat_w);
+        free(tensor);
+
+        if (!ref_data[i]) {
+            for (int j = 0; j < i; j++) {
+                free(ref_data[j]);
+                if (resized_imgs[j]) flux_image_free(resized_imgs[j]);
+            }
+            if (resized_imgs[i]) flux_image_free(resized_imgs[i]);
+            free(ref_latents);
+            free(ref_data);
+            free(resized_imgs);
+            free(text_emb);
+            set_error("Failed to encode reference image");
+            return NULL;
+        }
+
+        ref_latents[i].latent = ref_data[i];
+        ref_latents[i].h = lat_h;
+        ref_latents[i].w = lat_w;
+        ref_latents[i].t_offset = 10 * (i + 1);  /* 10, 20, 30, ... */
+    }
+
+    /* Free resized images (latents are now encoded) */
+    for (int i = 0; i < num_refs; i++) {
+        if (resized_imgs[i]) flux_image_free(resized_imgs[i]);
+    }
+    free(resized_imgs);
+
+    int latent_h = p.height / 16;
+    int latent_w = p.width / 16;
+    int image_seq_len = latent_h * latent_w;
+
+    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
+
+    /* Sample with multi-reference conditioning */
+    float *latent = flux_sample_euler_with_multi_refs(
+        ctx->transformer, ctx->qwen3_encoder,
+        z, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
+        ref_latents, num_refs,
+        text_emb, text_seq,
+        schedule, p.num_steps,
+        NULL
+    );
+
+    /* Cleanup */
+    free(z);
+    for (int i = 0; i < num_refs; i++) {
+        free(ref_data[i]);
+    }
+    free(ref_data);
+    free(ref_latents);
+    free(schedule);
+    free(text_emb);
+
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* Decode */
+    flux_image *result = NULL;
+    if (ctx->vae) {
+        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
+        result = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
+    }
+
+    free(latent);
+    return result;
 }
 
 /* ========================================================================

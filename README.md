@@ -39,6 +39,7 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run FLUX.2 at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts
+- **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3-4B encoder built-in, no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (~8GB freed)
 - **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
@@ -88,6 +89,32 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 - Good: `"oil painting of a woman with sunglasses, impressionist style"`
 - Less good: `"make it an oil painting"` (instructional prompts may work less well)
 
+**Super Resolution:** Since the reference image can be a different size than the output, you can use img2img for upscaling:
+
+```bash
+./flux -d flux-klein-model -i small.png -W 1024 -H 1024 -o big.png -p "Create an exact copy of the input image."
+```
+
+The model will generate a higher-resolution version while preserving the composition and details of the input.
+
+### Multi-Reference Generation
+
+Combine elements from multiple reference images:
+
+```bash
+./flux -d flux-klein-model -i car.png -i beach.png -p "a sports car on the beach" -o result.png
+```
+
+Each reference image is encoded separately and passed to the transformer with different positional embeddings (T=10, T=20, T=30, ...). The model attends to all references during generation, allowing it to combine elements from each.
+
+**Example:**
+- Reference 1: A red sports car
+- Reference 2: A tropical beach with palm trees
+- Prompt: "combine the two images"
+- Result: A red sports car on a tropical beach
+
+You can specify up to 16 reference images with multiple `-i` flags. The prompt guides how the references are combined.
+
 ### Command Line Options
 
 **Required:**
@@ -107,7 +134,7 @@ FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike tr
 
 **Image-to-image options:**
 ```
--i, --input PATH      Input image for img2img
+-i, --input PATH      Reference image (can be specified multiple times)
 ```
 
 **Output options:**

@@ -198,6 +198,7 @@ static double timer_end(void) {
 #define DEFAULT_WIDTH 256
 #define DEFAULT_HEIGHT 256
 #define DEFAULT_STEPS 4
+#define MAX_INPUT_IMAGES 16
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
@@ -211,8 +212,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: %d)\n", DEFAULT_STEPS);
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n\n");
-    fprintf(stderr, "Image-to-image options:\n");
-    fprintf(stderr, "  -i, --input PATH      Input image for img2img\n\n");
+    fprintf(stderr, "Reference images (img2img / multi-reference):\n");
+    fprintf(stderr, "  -i, --input PATH      Reference image (can specify up to %d)\n", MAX_INPUT_IMAGES);
+    fprintf(stderr, "                        Multiple -i flags combine images via in-context conditioning\n\n");
     fprintf(stderr, "Output options:\n");
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
@@ -226,6 +228,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
     fprintf(stderr, "  %s -d model/ -p \"oil painting\" -i photo.png -o art.png\n", prog);
+    fprintf(stderr, "  %s -d model/ -p \"combine them\" -i car.png -i beach.png -o result.png\n", prog);
 }
 
 /* ========================================================================
@@ -269,7 +272,8 @@ int main(int argc, char *argv[]) {
     char *model_dir = NULL;
     char *prompt = NULL;
     char *output_path = NULL;
-    char *input_path = NULL;
+    char *input_paths[MAX_INPUT_IMAGES] = {NULL};
+    int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
 
@@ -297,7 +301,13 @@ int main(int argc, char *argv[]) {
             case 'H': params.height = atoi(optarg); height_set = 1; break;
             case 's': params.num_steps = atoi(optarg); break;
             case 'S': params.seed = atoll(optarg); break;
-            case 'i': input_path = optarg; break;
+            case 'i':
+                if (num_inputs < MAX_INPUT_IMAGES) {
+                    input_paths[num_inputs++] = optarg;
+                } else {
+                    fprintf(stderr, "Warning: Maximum %d input images supported\n", MAX_INPUT_IMAGES);
+                }
+                break;
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
@@ -372,8 +382,11 @@ int main(int argc, char *argv[]) {
     LOG_VERBOSE("Output: %s\n", output_path);
     LOG_VERBOSE("Size: %dx%d\n", params.width, params.height);
     LOG_VERBOSE("Steps: %d\n", params.num_steps);
-    if (input_path) {
-        LOG_VERBOSE("Input: %s\n", input_path);
+    if (num_inputs > 0) {
+        LOG_VERBOSE("Input images: %d\n", num_inputs);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  [%d] %s\n", i + 1, input_paths[i]);
+        }
     }
     LOG_VERBOSE("\n");
 
@@ -424,30 +437,39 @@ int main(int argc, char *argv[]) {
         /* ============== Debug mode: use Python inputs ============== */
         LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
         output = flux_img2img_debug_py(ctx, &params);
-    } else if (input_path) {
-        /* ============== Image-to-image mode ============== */
-        LOG_NORMAL("Loading input image...");
+    } else if (num_inputs > 0) {
+        /* ============== Image-to-image mode (single or multi-reference) ============== */
+        LOG_NORMAL("Loading %d input image%s...", num_inputs, num_inputs > 1 ? "s" : "");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
         timer_begin();
 
-        flux_image *input = flux_image_load(input_path);
-        if (!input) {
-            fprintf(stderr, "\nError: Failed to load input image: %s\n", input_path);
-            flux_free(ctx);
-            return 1;
+        flux_image *inputs[MAX_INPUT_IMAGES];
+        for (int i = 0; i < num_inputs; i++) {
+            inputs[i] = flux_image_load(input_paths[i]);
+            if (!inputs[i]) {
+                fprintf(stderr, "\nError: Failed to load input image: %s\n", input_paths[i]);
+                for (int j = 0; j < i; j++) flux_image_free(inputs[j]);
+                flux_free(ctx);
+                return 1;
+            }
         }
 
         LOG_NORMAL(" done (%.1fs)\n", timer_end());
-        LOG_VERBOSE("  Input: %dx%d, %d channels\n",
-                    input->width, input->height, input->channels);
+        for (int i = 0; i < num_inputs; i++) {
+            LOG_VERBOSE("  Input[%d]: %dx%d, %d channels\n",
+                        i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
+        }
 
-        /* Use input image dimensions if not explicitly set */
-        if (!width_set) params.width = input->width;
-        if (!height_set) params.height = input->height;
+        /* Use first input image dimensions if not explicitly set */
+        if (!width_set) params.width = inputs[0]->width;
+        if (!height_set) params.height = inputs[0]->height;
 
-        /* Generate */
-        output = flux_img2img(ctx, prompt, input, &params);
-        flux_image_free(input);
+        /* Generate with multi-reference */
+        output = flux_multiref(ctx, prompt, (const flux_image **)inputs, num_inputs, &params);
+
+        for (int i = 0; i < num_inputs; i++) {
+            flux_image_free(inputs[i]);
+        }
 
     } else if (embeddings_path) {
         /* ============== External embeddings mode ============== */

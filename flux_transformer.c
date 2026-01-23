@@ -3446,6 +3446,232 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
 }
 
 /* ========================================================================
+ * Transformer Forward with Multiple Reference Images
+ * ======================================================================== */
+
+typedef struct {
+    const float *latent;
+    int h, w;
+    int t_offset;
+} flux_ref_t;
+
+/*
+ * Extended transformer forward that accepts multiple reference images.
+ * Each reference gets a different T offset in RoPE positioning.
+ */
+float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
+                                                const float *img_latent, int img_h, int img_w,
+                                                const flux_ref_t *refs, int num_refs,
+                                                const float *txt_emb, int txt_seq,
+                                                float timestep) {
+    /* No references - delegate to regular forward */
+    if (refs == NULL || num_refs == 0) {
+        return flux_transformer_forward(tf, img_latent, img_h, img_w,
+                                        txt_emb, txt_seq, timestep);
+    }
+
+    /* Single reference - use optimized path */
+    if (num_refs == 1) {
+        return flux_transformer_forward_with_refs(tf, img_latent, img_h, img_w,
+                                                  refs[0].latent, refs[0].h, refs[0].w,
+                                                  refs[0].t_offset,
+                                                  txt_emb, txt_seq, timestep);
+    }
+
+    int hidden = tf->hidden_size;
+    int img_seq = img_h * img_w;
+    int head_dim = tf->head_dim;
+    int axis_dim = 32;
+    int channels = tf->latent_channels;
+
+    /* Calculate total reference sequence length */
+    int total_ref_seq = 0;
+    for (int r = 0; r < num_refs; r++) {
+        total_ref_seq += refs[r].h * refs[r].w;
+    }
+
+    int combined_img_seq = img_seq + total_ref_seq;
+    int total_seq = combined_img_seq + txt_seq;
+
+    /* Ensure work buffers */
+    if (ensure_work_buffers(tf, total_seq) < 0) {
+        fprintf(stderr, "Failed to allocate work buffers for seq_len=%d\n", total_seq);
+        return NULL;
+    }
+    if (ensure_attn_scores(tf, combined_img_seq, txt_seq) < 0) {
+        fprintf(stderr, "Failed to allocate attention scores buffer\n");
+        return NULL;
+    }
+
+    /* Get timestep embedding */
+    int sincos_dim = tf->time_embed.sincos_dim;
+    float *t_emb = (float *)malloc(hidden * sizeof(float));
+    float t_sincos[256];
+    get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
+    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
+
+    /* Allocate combined RoPE arrays */
+    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+
+    /* Compute RoPE for target image (T=0) */
+    compute_rope_2d(combined_rope_cos, combined_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
+
+    /* Compute RoPE for each reference and append */
+    int rope_offset = img_seq * axis_dim * 4;
+    for (int r = 0; r < num_refs; r++) {
+        int ref_seq = refs[r].h * refs[r].w;
+        compute_rope_2d_with_t_offset(combined_rope_cos + rope_offset,
+                                      combined_rope_sin + rope_offset,
+                                      refs[r].h, refs[r].w,
+                                      axis_dim, tf->rope_theta, refs[r].t_offset);
+        rope_offset += ref_seq * axis_dim * 4;
+    }
+
+    /* Compute text RoPE */
+    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
+
+    /* Transpose and concatenate all image latents */
+    float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+
+    /* Target image */
+    for (int pos = 0; pos < img_seq; pos++) {
+        for (int c = 0; c < channels; c++) {
+            combined_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
+        }
+    }
+
+    /* Reference images */
+    int trans_offset = img_seq;
+    for (int r = 0; r < num_refs; r++) {
+        int ref_seq = refs[r].h * refs[r].w;
+        for (int pos = 0; pos < ref_seq; pos++) {
+            for (int c = 0; c < channels; c++) {
+                combined_transposed[(trans_offset + pos) * channels + c] =
+                    refs[r].latent[c * ref_seq + pos];
+            }
+        }
+        trans_offset += ref_seq;
+    }
+
+    /* Project combined image latent to hidden */
+    float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
+                       combined_img_seq, tf->latent_channels, hidden);
+    free(combined_transposed);
+
+    /* Project text embeddings to hidden */
+    float *txt_hidden = tf->txt_hidden;
+    LINEAR_BF16_OR_F32(txt_hidden, txt_emb, tf->txt_in_weight, tf->txt_in_weight_bf16,
+                       txt_seq, tf->text_dim, hidden);
+
+    /* Pre-compute AdaLN modulation */
+    int double_mod_size = hidden * 6;
+    for (int j = 0; j < hidden; j++) {
+        float x = t_emb[j];
+        tf->t_emb_silu[j] = x / (1.0f + expf(-x));
+    }
+    flux_linear_nobias(tf->double_mod_img, tf->t_emb_silu, tf->adaln_double_img_weight,
+                       1, hidden, double_mod_size);
+    flux_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
+                       1, hidden, double_mod_size);
+
+    /* Double blocks */
+    for (int i = 0; i < tf->num_double_layers; i++) {
+        if (tf->use_mmap) {
+            load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        double_block_forward(combined_hidden, txt_hidden,
+                             &tf->double_blocks[i],
+                             tf->double_mod_img, tf->double_mod_txt,
+                             combined_rope_cos, combined_rope_sin,
+                             txt_rope_cos, txt_rope_sin,
+                             combined_img_seq, txt_seq, tf);
+        if (tf->use_mmap) {
+            free_double_block_weights(&tf->double_blocks[i]);
+        }
+        if (flux_substep_callback)
+            flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
+    }
+
+    /* Concatenate for single blocks */
+    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
+    memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
+    free(combined_hidden);
+
+    /* Single blocks */
+    for (int i = 0; i < tf->num_single_layers; i++) {
+        if (tf->use_mmap) {
+            load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
+                                      tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
+        }
+        single_block_forward(concat_hidden, &tf->single_blocks[i],
+                             t_emb, tf->adaln_single_weight,
+                             combined_rope_cos, combined_rope_sin,
+                             txt_rope_cos, txt_rope_sin,
+                             total_seq, txt_seq, tf);
+        if (tf->use_mmap) {
+            free_single_block_weights(&tf->single_blocks[i]);
+        }
+        if (flux_substep_callback)
+            flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
+    }
+
+    /* Extract ONLY target image hidden states */
+    float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
+    memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
+    free(concat_hidden);
+
+    /* Final layer */
+    for (int i = 0; i < hidden; i++) {
+        float x = t_emb[i];
+        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
+    }
+
+    float *final_mod = tf->double_mod_img;
+    flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
+
+    float *final_scale = final_mod;
+    float *final_shift = final_mod + hidden;
+
+    float *final_norm = tf->work1;
+    apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
+    free(img_hidden);
+
+    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
+                       img_seq, hidden, tf->latent_channels);
+
+    /* Transpose output from NLC to NCHW */
+    float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    for (int pos = 0; pos < img_seq; pos++) {
+        for (int c = 0; c < channels; c++) {
+            output[c * img_seq + pos] = output_nlc[pos * channels + c];
+        }
+    }
+    free(output_nlc);
+
+    free(t_emb);
+    free(combined_rope_cos);
+    free(combined_rope_sin);
+    free(txt_rope_cos);
+    free(txt_rope_sin);
+
+    if (flux_substep_callback)
+        flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
+
+#ifdef USE_METAL
+    flux_gpu_sync();
+#endif
+
+    return output;
+}
+
+/* ========================================================================
  * Transformer Loading
  * ======================================================================== */
 
