@@ -22,6 +22,7 @@
 
 #include "flux.h"
 #include "flux_kernels.h"
+#include "flux_cli.h"
 #include "kitty.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -322,15 +323,21 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
-    if (!prompt && !embeddings_path && !debug_py) {
-        fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-    if (!output_path) {
-        fprintf(stderr, "Error: Output path (-o) is required\n\n");
-        print_usage(argv[0]);
-        return 1;
+
+    /* Interactive mode: -d provided but no -p, -e, -o, or --debug-py */
+    int interactive_mode = (!prompt && !embeddings_path && !output_path && !debug_py);
+
+    if (!interactive_mode) {
+        if (!prompt && !embeddings_path && !debug_py) {
+            fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        if (!output_path) {
+            fprintf(stderr, "Error: Output path (-o) is required\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
     }
 
     /* Validate parameters */
@@ -390,6 +397,13 @@ int main(int argc, char *argv[]) {
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_VERBOSE("  Model info: %s\n", flux_model_info(ctx));
+
+    /* Interactive mode: start REPL */
+    if (interactive_mode) {
+        int rc = flux_cli_run(ctx, model_dir);
+        flux_free(ctx);
+        return rc;
+    }
 
     /* Set up progress callbacks (for normal and verbose modes) */
     if (output_level >= OUTPUT_NORMAL) {
