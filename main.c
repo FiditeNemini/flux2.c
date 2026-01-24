@@ -23,7 +23,7 @@
 #include "flux.h"
 #include "flux_kernels.h"
 #include "flux_cli.h"
-#include "kitty.h"
+#include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +53,7 @@ static output_level_t output_level = OUTPUT_NORMAL;
 
 static int cli_current_step = 0;
 static int cli_legend_printed = 0;
+static term_graphics_proto cli_graphics_proto = TERM_PROTO_NONE;
 
 /* Called at the start of each sampling step */
 static void cli_step_callback(int step, int total) {
@@ -136,11 +137,11 @@ static void cli_phase_callback(const char *phase, int done) {
 }
 
 /* Set up CLI progress callbacks */
-/* Step image callback - display intermediate images using Kitty protocol */
+/* Step image callback - display intermediate images in terminal */
 static void cli_step_image_callback(int step, int total, const flux_image *img) {
     (void)total;
     fprintf(stderr, "\n[Step %d]\n", step);
-    kitty_display_image(img);
+    terminal_display_image(img, cli_graphics_proto);
 }
 
 static void cli_setup_progress(void) {
@@ -219,7 +220,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -q, --quiet           Silent mode, no output\n");
     fprintf(stderr, "  -v, --verbose         Detailed output\n");
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
-    fprintf(stderr, "      --show-steps      Display each denoising step (Kitty/Ghostty only)\n\n");
+    fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
@@ -426,11 +427,10 @@ int main(int argc, char *argv[]) {
 
     /* Set up step image callback if requested */
     if (show_steps) {
-        if (graphics_proto == TERM_PROTO_ITERM2) {
-            fprintf(stderr, "Warning: --show-steps requires Kitty protocol (not supported in iTerm2)\n");
-        } else if (graphics_proto == TERM_PROTO_NONE) {
-            fprintf(stderr, "Warning: --show-steps requires Kitty or Ghostty terminal\n");
+        if (graphics_proto == TERM_PROTO_NONE) {
+            fprintf(stderr, "Warning: --show-steps requires a supported terminal (Kitty, Ghostty, or iTerm2)\n");
         } else {
+            cli_graphics_proto = graphics_proto;
             flux_set_step_image_callback(ctx, cli_step_image_callback);
         }
     }

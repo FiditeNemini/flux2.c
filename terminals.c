@@ -1,19 +1,23 @@
 /*
- * kitty.c - Terminal graphics protocol support (Kitty and iTerm2)
+ * terminals.c - Terminal graphics protocol support
  *
- * Kitty graphics protocol:
- *   Format: \033_G<control>;<base64-payload>\033\\
- *   For large images, data is sent in chunks with m=1 (more) or m=0 (last).
+ * Supports multiple terminal graphics protocols:
+ *   - Kitty graphics protocol (Kitty, Ghostty)
+ *   - iTerm2 inline image protocol
  *
- * iTerm2 inline image protocol:
- *   Format: \033]1337;File=inline=1:<base64-payload>\a
- *   See: https://iterm2.com/documentation-images.html
+ * The unified API (terminal_display_*) auto-detects and uses the appropriate
+ * protocol based on environment variables.
  */
 
-#include "kitty.h"
+#include "terminals.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+/* ======================================================================
+ * Terminal Detection
+ * ====================================================================== */
 
 /*
  * Detect terminal graphics capability from environment variables.
@@ -37,7 +41,10 @@ term_graphics_proto detect_terminal_graphics(void) {
     return TERM_PROTO_NONE;
 }
 
-/* Base64 encoding table */
+/* ======================================================================
+ * Base64 Encoding (shared by all protocols)
+ * ====================================================================== */
+
 static const char b64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -72,14 +79,22 @@ static char *base64_encode(const unsigned char *data, size_t len, size_t *out_le
     return encoded;
 }
 
-/*
- * Send PNG data using Kitty graphics protocol.
+/* ======================================================================
+ * Kitty Graphics Protocol
+ *
+ * Format: \033_G<control>;<base64-payload>\033\\
+ * Supports raw pixel data (f=24 RGB, f=32 RGBA) and PNG (f=100).
  * Data is sent in chunks to avoid terminal buffer issues.
+ * ====================================================================== */
+
+/*
+ * Send data using Kitty graphics protocol in chunks.
+ * format: 24=RGB, 32=RGBA, 100=PNG
  */
-static int kitty_send_png(const unsigned char *png_data, size_t png_size) {
-    /* Base64 encode the PNG data */
+static int kitty_send_data(const unsigned char *data, size_t size,
+                           int format, int width, int height) {
     size_t b64_len;
-    char *b64_data = base64_encode(png_data, png_size, &b64_len);
+    char *b64_data = base64_encode(data, size, &b64_len);
     if (!b64_data) return -1;
 
     /* Send in chunks (4096 bytes of base64 per chunk is safe) */
@@ -93,18 +108,23 @@ static int kitty_send_png(const unsigned char *png_data, size_t png_size) {
         int more = (offset + this_chunk) < b64_len;
 
         if (first) {
-            /* First chunk: a=T (transmit+display), f=100 (PNG), t=d (direct) */
-            printf("\033_Ga=T,f=100,t=d,m=%d;", more ? 1 : 0);
+            /* First chunk: a=T (transmit+display), f=format, t=d (direct) */
+            if (format == 100) {
+                /* PNG: no dimensions needed */
+                printf("\033_Ga=T,f=100,t=d,m=%d;", more ? 1 : 0);
+            } else {
+                /* Raw: include dimensions */
+                printf("\033_Ga=T,f=%d,s=%d,v=%d,m=%d;",
+                       format, width, height, more ? 1 : 0);
+            }
             first = 0;
         } else {
             /* Continuation chunk */
             printf("\033_Gm=%d;", more ? 1 : 0);
         }
 
-        /* Write the base64 chunk */
         fwrite(b64_data + offset, 1, this_chunk, stdout);
         printf("\033\\");
-
         offset += this_chunk;
     }
 
@@ -120,7 +140,6 @@ int kitty_display_png(const char *path) {
         return -1;
     }
 
-    /* Get file size */
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -130,7 +149,6 @@ int kitty_display_png(const char *path) {
         return -1;
     }
 
-    /* Read PNG data */
     unsigned char *png_data = malloc(size);
     if (!png_data) {
         fclose(f);
@@ -144,63 +162,32 @@ int kitty_display_png(const char *path) {
     }
     fclose(f);
 
-    int result = kitty_send_png(png_data, size);
+    int result = kitty_send_data(png_data, size, 100, 0, 0);
     free(png_data);
-
-    /* Print newline after image */
     printf("\n");
-
     return result;
 }
 
 int kitty_display_image(const flux_image *img) {
     if (!img || !img->data) return -1;
 
-    /* Raw pixel data size */
     size_t data_size = (size_t)img->width * img->height * img->channels;
+    int format = (img->channels == 4) ? 32 : 24;
 
-    /* Base64 encode the raw pixel data */
-    size_t b64_len;
-    char *b64_data = base64_encode(img->data, data_size, &b64_len);
-    if (!b64_data) return -1;
-
-    /* f=24 for RGB (3 channels), f=32 for RGBA (4 channels) */
-    int fmt = (img->channels == 4) ? 32 : 24;
-
-    /* Send in chunks */
-    const size_t chunk_size = 4096;
-    size_t offset = 0;
-    int first = 1;
-
-    while (offset < b64_len) {
-        size_t remaining = b64_len - offset;
-        size_t this_chunk = remaining < chunk_size ? remaining : chunk_size;
-        int more = (offset + this_chunk) < b64_len;
-
-        if (first) {
-            /* First chunk: a=T (transmit+display), f=24/32, s=width, v=height */
-            printf("\033_Ga=T,f=%d,s=%d,v=%d,m=%d;",
-                   fmt, img->width, img->height, more ? 1 : 0);
-            first = 0;
-        } else {
-            printf("\033_Gm=%d;", more ? 1 : 0);
-        }
-
-        fwrite(b64_data + offset, 1, this_chunk, stdout);
-        printf("\033\\");
-        offset += this_chunk;
-    }
-
-    fflush(stdout);
-    free(b64_data);
+    int result = kitty_send_data(img->data, data_size, format,
+                                  img->width, img->height);
     printf("\n");
-    return 0;
+    return result;
 }
 
-/*
- * Send PNG data using iTerm2 inline image protocol.
- * Format: \033]1337;File=inline=1:<base64>\a
- */
+/* ======================================================================
+ * iTerm2 Inline Image Protocol
+ *
+ * Format: \033]1337;File=inline=1:<base64-payload>\a
+ * Only supports encoded image formats (PNG, JPEG, etc.), not raw pixels.
+ * See: https://iterm2.com/documentation-images.html
+ * ====================================================================== */
+
 static int iterm2_send_png(const unsigned char *png_data, size_t png_size) {
     size_t b64_len;
     char *b64_data = base64_encode(png_data, png_size, &b64_len);
@@ -223,7 +210,6 @@ int iterm2_display_png(const char *path) {
         return -1;
     }
 
-    /* Get file size */
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -233,7 +219,6 @@ int iterm2_display_png(const char *path) {
         return -1;
     }
 
-    /* Read PNG data */
     unsigned char *png_data = malloc(size);
     if (!png_data) {
         fclose(f);
@@ -252,55 +237,60 @@ int iterm2_display_png(const char *path) {
     return result;
 }
 
+/*
+ * Display raw image data in iTerm2.
+ * iTerm2 requires PNG format, so we encode to PNG via a temp file.
+ * This is transparent to the caller - API matches kitty_display_image().
+ */
+int iterm2_display_image(const flux_image *img) {
+    if (!img || !img->data) return -1;
+
+    /* Create temp file for PNG */
+    char tmppath[] = "/tmp/flux_iterm_XXXXXX.png";
+    int fd = mkstemps(tmppath, 4);
+    if (fd < 0) {
+        fprintf(stderr, "iterm2: cannot create temp file\n");
+        return -1;
+    }
+    close(fd);
+
+    /* Save image as PNG */
+    if (flux_image_save(img, tmppath) != 0) {
+        unlink(tmppath);
+        return -1;
+    }
+
+    /* Display the PNG */
+    int result = iterm2_display_png(tmppath);
+
+    /* Clean up */
+    unlink(tmppath);
+    return result;
+}
+
+/* ======================================================================
+ * Unified Terminal API
+ *
+ * These functions automatically use the appropriate protocol.
+ * ====================================================================== */
+
 int terminal_display_png(const char *path, term_graphics_proto proto) {
     switch (proto) {
-        case TERM_PROTO_ITERM2:
-            return iterm2_display_png(path);
         case TERM_PROTO_KITTY:
             return kitty_display_png(path);
+        case TERM_PROTO_ITERM2:
+            return iterm2_display_png(path);
         default:
             return -1;
     }
 }
 
-/*
- * Display raw image data using iTerm2 inline image protocol.
- * iTerm2 requires PNG format, so we need to encode the raw pixels first.
- * For simplicity, we send raw RGB/RGBA with dimensions in the protocol.
- * Note: iTerm2's protocol actually requires a file format (PNG/JPEG/etc),
- * but we can use the raw data with proper headers.
- */
-static int iterm2_send_raw(const unsigned char *data, size_t size,
-                           int width, int height, int channels __attribute__((unused))) {
-    size_t b64_len;
-    char *b64_data = base64_encode(data, size, &b64_len);
-    if (!b64_data) return -1;
-
-    /* iTerm2 protocol with size hints */
-    printf("\033]1337;File=inline=1;width=%dpx;height=%dpx:",
-           width, height);
-    fwrite(b64_data, 1, b64_len, stdout);
-    printf("\a\n");
-    fflush(stdout);
-
-    free(b64_data);
-    return 0;
-}
-
-int iterm2_display_image(const flux_image *img) {
-    if (!img || !img->data) return -1;
-
-    size_t data_size = (size_t)img->width * img->height * img->channels;
-    return iterm2_send_raw(img->data, data_size,
-                           img->width, img->height, img->channels);
-}
-
 int terminal_display_image(const flux_image *img, term_graphics_proto proto) {
     switch (proto) {
-        case TERM_PROTO_ITERM2:
-            return iterm2_display_image(img);
         case TERM_PROTO_KITTY:
             return kitty_display_image(img);
+        case TERM_PROTO_ITERM2:
+            return iterm2_display_image(img);
         default:
             return -1;
     }

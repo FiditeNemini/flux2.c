@@ -18,7 +18,7 @@
 
 #include "flux.h"
 #include "linenoise.h"
-#include "kitty.h"
+#include "terminals.h"
 
 /* ======================================================================
  * Constants
@@ -32,14 +32,8 @@
 #define CLI_REFS_INITIAL 16   /* Initial capacity for $N reference cache */
 #define CLI_MAX_PROMPT_REFS 16  /* Max references in a single prompt */
 
-/* ======================================================================
- * Terminal Detection
- * ====================================================================== */
-
-static int has_kitty_graphics(void) {
-    return getenv("KITTY_WINDOW_ID") != NULL ||
-           getenv("GHOSTTY_RESOURCES_DIR") != NULL;
-}
+/* Terminal graphics protocol (detected at startup) */
+static term_graphics_proto cli_term_proto = TERM_PROTO_NONE;
 
 /* ======================================================================
  * Session State
@@ -228,7 +222,7 @@ static void display_image(const char *path) {
     if (state.show_enabled) {
         flux_image *img = flux_image_load(path);
         if (img) {
-            kitty_display_image(img);
+            terminal_display_image(img, cli_term_proto);
             flux_image_free(img);
         }
     }
@@ -472,7 +466,7 @@ static void cmd_load(char *arg) {
 
     /* Display in Kitty-capable terminal */
     if (state.show_enabled) {
-        kitty_display_image(img);
+        terminal_display_image(img, cli_term_proto);
     }
 
     flux_image_free(img);
@@ -606,7 +600,7 @@ static void cmd_explore(char *arg) {
         flux_image *img = flux_generate_with_embeddings(state.ctx, embeddings,
                                                          seq_len, &params);
         if (img) {
-            kitty_display_image(img);
+            terminal_display_image(img, cli_term_proto);
             flux_image_free(img);
             printf("\n");
         } else {
@@ -773,7 +767,10 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
     state.height = CLI_DEFAULT_HEIGHT;
     state.steps = CLI_DEFAULT_STEPS;
     state.seed = -1;
-    state.show_enabled = has_kitty_graphics();
+
+    /* Detect terminal graphics support */
+    cli_term_proto = detect_terminal_graphics();
+    state.show_enabled = (cli_term_proto != TERM_PROTO_NONE);
 
     /* Create temp directory */
     if (create_tmpdir() < 0) {

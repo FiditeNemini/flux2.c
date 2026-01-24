@@ -56,7 +56,7 @@ Display generated images directly in your terminal with `--show`, or watch the d
 # Display final image in terminal (auto-detects Kitty/Ghostty/iTerm2)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show
 
-# Display each denoising step (Kitty/Ghostty only, slower but interesting to watch)
+# Display each denoising step (slower, but interesting to watch)
 ./flux -d flux-klein-model -p "a cute robot" -o robot.png --show-steps
 ```
 
@@ -173,7 +173,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 -q, --quiet           Silent mode, no output
 -v, --verbose         Show detailed config and timing info
     --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)
-    --show-steps      Display each denoising step (Kitty/Ghostty only)
+    --show-steps      Display each denoising step (slower)
 ```
 
 **Other options:**
