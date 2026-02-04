@@ -3119,11 +3119,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
     if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
-        static int bf16_path_logged = 0;
-        if (!bf16_path_logged) {
-            bf16_path_logged = 1;
-            fprintf(stderr, "[BF16] Using fused bf16 pipeline for transformer\n");
-        }
         float *bf16_output = flux_transformer_forward_bf16(tf, img_transposed, img_seq,
                                                            img_seq, /* extract_seq = img_seq for txt2img */
                                                            txt_emb, txt_seq, t_emb,
@@ -3628,11 +3623,6 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
     if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
-        static int bf16_refs_logged = 0;
-        if (!bf16_refs_logged) {
-            bf16_refs_logged = 1;
-            fprintf(stderr, "[BF16] Using fused bf16 pipeline for img2img with refs\n");
-        }
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -3875,11 +3865,6 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 #ifdef USE_METAL
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
     if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
-        static int bf16_multiref_logged = 0;
-        if (!bf16_multiref_logged) {
-            bf16_multiref_logged = 1;
-            fprintf(stderr, "[BF16] Using fused bf16 pipeline for multi-ref img2img\n");
-        }
         float *bf16_output = flux_transformer_forward_bf16(tf, combined_transposed, combined_img_seq,
                                                            img_seq, /* extract_seq = target only */
                                                            txt_emb, txt_seq, t_emb,
@@ -4407,7 +4392,8 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
-        printf("Using bf16 weights for GPU acceleration\n");
+        if (flux_verbose)
+            fprintf(stderr, "Using bf16 weights for GPU acceleration\n");
     }
 #else
     tf->use_bf16 = 0;
@@ -4651,7 +4637,8 @@ flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *s
 #ifdef USE_METAL
     tf->use_bf16 = flux_metal_available();
     if (tf->use_bf16) {
-        printf("Using bf16 weights for GPU acceleration (mmap mode)\n");
+        if (flux_verbose)
+            fprintf(stderr, "Using bf16 weights for GPU acceleration (mmap mode)\n");
     }
 #else
     tf->use_bf16 = 0;

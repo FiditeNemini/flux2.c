@@ -253,20 +253,22 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
     }
 
     /* Print timing summary */
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown:\n");
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown:\n");
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+        fprintf(stderr, "  Transformer breakdown:\n");
+        fprintf(stderr, "    Double blocks: %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_double, 100.0 * flux_timing_transformer_double / flux_timing_transformer_total);
+        fprintf(stderr, "    Single blocks: %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_single, 100.0 * flux_timing_transformer_single / flux_timing_transformer_total);
+        fprintf(stderr, "    Final layer:   %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / flux_timing_transformer_total);
+        fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
-    fprintf(stderr, "  Transformer breakdown:\n");
-    fprintf(stderr, "    Double blocks: %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_double, 100.0 * flux_timing_transformer_double / flux_timing_transformer_total);
-    fprintf(stderr, "    Single blocks: %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_single, 100.0 * flux_timing_transformer_single / flux_timing_transformer_total);
-    fprintf(stderr, "    Final layer:   %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / flux_timing_transformer_total);
-    fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
 
     return z_curr;
 }
@@ -344,12 +346,14 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
     }
 
     /* Print timing summary */
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (img2img with refs):\n");
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (img2img with refs):\n");
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     return z_curr;
 }
@@ -411,12 +415,14 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
         }
     }
 
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (multi-ref, %d refs):\n", num_refs);
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (multi-ref, %d refs):\n", num_refs);
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     return z_curr;
 }
@@ -494,12 +500,14 @@ float *flux_sample_euler_cfg(void *transformer, void *text_encoder,
         }
     }
 
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (CFG, guidance=%.1f):\n", guidance_scale);
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (CFG, guidance=%.1f):\n", guidance_scale);
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     return z_curr;
 }
@@ -573,12 +581,14 @@ float *flux_sample_euler_cfg_with_refs(void *transformer, void *text_encoder,
         }
     }
 
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (CFG img2img, guidance=%.1f):\n", guidance_scale);
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (CFG img2img, guidance=%.1f):\n", guidance_scale);
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     return z_curr;
 }
@@ -651,13 +661,15 @@ float *flux_sample_euler_cfg_with_multi_refs(void *transformer, void *text_encod
         }
     }
 
-    double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (CFG multi-ref, %d refs, guidance=%.1f):\n",
-            num_refs, guidance_scale);
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+    if (flux_verbose) {
+        double total_denoising = get_time_ms() - total_denoising_start;
+        fprintf(stderr, "\nDenoising timing breakdown (CFG multi-ref, %d refs, guidance=%.1f):\n",
+                num_refs, guidance_scale);
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     return z_curr;
 }

@@ -14,6 +14,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include "flux_metal.h"
+#include "flux_kernels.h"
 #include "flux_shaders_source.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -456,8 +457,9 @@ int flux_metal_init(void) {
         memset(g_weight_cache, 0, sizeof(g_weight_cache));
 
         g_initialized = 1;
-        fprintf(stderr, "Metal: GPU acceleration enabled (%s)\n",
-                [[g_device name] UTF8String]);
+        if (flux_verbose)
+            fprintf(stderr, "Metal: GPU acceleration enabled (%s)\n",
+                    [[g_device name] UTF8String]);
 
         /* Load compute shaders (high thresholds keep them dormant for small ops) */
         flux_metal_init_shaders();
@@ -3347,7 +3349,8 @@ int flux_metal_init_shaders(void) {
         }
 
         g_shaders_initialized = 1;
-        fprintf(stderr, "Metal shaders: compute kernels loaded\n");
+        if (flux_verbose)
+            fprintf(stderr, "Metal shaders: compute kernels loaded\n");
         return 1;
     }
 }

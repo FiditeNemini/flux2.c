@@ -11,6 +11,7 @@
 
 #include "flux_qwen3.h"
 #include "flux_safetensors.h"
+#include "flux_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -868,11 +869,9 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             memcpy(model->layer_outputs[2], model->hidden_state, seq_len * hidden * sizeof(float));
         }
 
-        /* Progress indicator */
-        if ((layer_idx + 1) % 6 == 0) {
-            fprintf(stderr, ".");
-            fflush(stderr);
-        }
+        /* Progress callback */
+        if (flux_text_progress_callback)
+            flux_text_progress_callback(layer_idx, model->num_layers);
     }
 
 #ifdef USE_METAL
@@ -1189,7 +1188,8 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
      * Set FLUX_QWEN3_NO_BF16=1 to disable for debugging. */
     model->use_bf16 = (flux_metal_available() && !getenv("FLUX_QWEN3_NO_BF16")) ? 1 : 0;
     if (model->use_bf16) {
-        fprintf(stderr, "Qwen3: bf16 GPU acceleration enabled\n");
+        if (flux_verbose)
+            fprintf(stderr, "Qwen3: bf16 GPU acceleration enabled\n");
     }
 #endif
     model->layers = calloc(model->num_layers, sizeof(qwen3_layer_t));
@@ -1228,7 +1228,8 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     }
 
     /* DON'T load layer weights - they'll be loaded on-demand in forward pass */
-    fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
+    if (flux_verbose)
+        fprintf(stderr, "Mmap mode: layer weights will be loaded on-demand\n");
 
     /* Compute RoPE frequencies */
     int max_seq = QWEN3_MAX_SEQ_LEN;

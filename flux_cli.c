@@ -17,6 +17,7 @@
 #include <errno.h>
 
 #include "flux.h"
+#include "flux_kernels.h"
 #include "flux_qwen3.h"  /* For QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM */
 #include "embcache.h"
 #include "linenoise.h"
@@ -240,6 +241,71 @@ static void display_image(const char *path) {
 }
 
 /* ======================================================================
+ * Progress display
+ * ====================================================================== */
+
+enum { PROG_NONE, PROG_TEXT, PROG_VAE, PROG_STEP };
+static int cli_progress_phase = PROG_NONE;
+
+static void cli_text_progress(int layer, int total) {
+    (void)total;
+    (void)layer;
+    if (cli_progress_phase != PROG_TEXT) {
+        if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+        cli_progress_phase = PROG_TEXT;
+    }
+    fprintf(stderr, "t");
+    fflush(stderr);
+}
+
+static void cli_vae_progress(int block, int total) {
+    (void)total;
+    (void)block;
+    if (cli_progress_phase != PROG_VAE) {
+        if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+        cli_progress_phase = PROG_VAE;
+    }
+    fprintf(stderr, "v");
+    fflush(stderr);
+}
+
+static void cli_step_progress(int step, int total) {
+    if (cli_progress_phase != PROG_NONE) fprintf(stderr, "\n");
+    cli_progress_phase = PROG_STEP;
+    fprintf(stderr, "[%d/%d]:", step, total);
+    fflush(stderr);
+}
+
+static void cli_substep_progress(flux_substep_type_t type, int index, int total) {
+    (void)index;
+    (void)total;
+    if (type == FLUX_SUBSTEP_DOUBLE_BLOCK)
+        fprintf(stderr, "d");
+    else if (type == FLUX_SUBSTEP_SINGLE_BLOCK)
+        fprintf(stderr, "s");
+    else if (type == FLUX_SUBSTEP_FINAL_LAYER)
+        fprintf(stderr, "f");
+    fflush(stderr);
+}
+
+static void cli_progress_start(void) {
+    cli_progress_phase = PROG_NONE;
+    flux_text_progress_callback = cli_text_progress;
+    flux_vae_progress_callback = cli_vae_progress;
+    flux_step_callback = cli_step_progress;
+    flux_substep_callback = cli_substep_progress;
+}
+
+static void cli_progress_end(void) {
+    fprintf(stderr, "\n");
+    cli_progress_phase = PROG_NONE;
+    flux_text_progress_callback = NULL;
+    flux_vae_progress_callback = NULL;
+    flux_step_callback = NULL;
+    flux_substep_callback = NULL;
+}
+
+/* ======================================================================
  * Generation
  * ====================================================================== */
 
@@ -262,6 +328,9 @@ static int generate_image(const char *prompt, const char *ref_image,
     /* Start timing */
     struct timespec start_time, end_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+    /* Set up progress callbacks */
+    cli_progress_start();
 
     /* Generate */
     flux_image *img;
@@ -322,6 +391,8 @@ static int generate_image(const char *prompt, const char *ref_image,
             }
         }
     }
+
+    cli_progress_end();
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -393,6 +464,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     printf("Generating %dx%d (multi-ref, %d images)...\n",
            params.width, params.height, num_refs);
 
+    cli_progress_start();
+
     flux_image *img = flux_multiref(state.ctx, prompt,
                                      (const flux_image **)refs, num_refs, &params);
 
@@ -401,6 +474,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
         flux_image_free(refs[i]);
     }
     free(refs);
+
+    cli_progress_end();
 
     /* End timing */
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -925,6 +1000,7 @@ int flux_cli_run(flux_ctx *ctx, const char *model_dir) {
         linenoiseHistoryLoad(history_path);
     }
     linenoiseHistorySetMaxLen(500);
+    linenoiseSetMultiLine(1);
 
     print_banner();
 

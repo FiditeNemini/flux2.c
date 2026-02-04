@@ -136,11 +136,6 @@ static void vae_conv2d(float *out, const float *in,
         flux_metal_conv2d(out, in, weight, bias,
                           batch, in_ch, out_ch, H, W,
                           kH, kW, stride, padding)) {
-        static int logged = 0;
-        if (!logged) {
-            fprintf(stderr, "[VAE: using MPS conv2d path] ");
-            logged = 1;
-        }
         return;
     }
 #endif
@@ -345,6 +340,8 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
 
     int block_idx = 0;
     int down_idx = 0;
+    int progress = 0;
+    int total_blocks = 4 * vae->num_res_blocks + 3;  /* down resblocks + mid */
 
     /* Down blocks */
     for (int level = 0; level < 4; level++) {
@@ -355,6 +352,8 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
             flux_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (flux_vae_progress_callback)
+                flux_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Downsample (except last level) */
@@ -381,13 +380,19 @@ float *flux_vae_encode(flux_vae_t *vae, const float *img,
     /* Mid block: resblock -> attn -> resblock */
     resblock_forward(work, x, &vae->enc_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->enc_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->enc_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
 
     /* Output: norm -> swish -> conv */
     flux_group_norm(work, x, vae->enc_norm_out_weight, vae->enc_norm_out_bias,
@@ -489,15 +494,24 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
 
     /* Mid block: resblock -> attn -> resblock */
+    int progress = 0;
+    int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);  /* mid + up resblocks */
+
     resblock_forward(work, x, &vae->dec_mid_block1, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     if (attnblock_forward(x, work, &vae->dec_mid_attn, vae->work3,
                           batch, cur_h, cur_w, vae->num_groups, vae->eps) < 0) {
         return NULL;  /* OOM in attention */
     }
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
     resblock_forward(work, x, &vae->dec_mid_block2, vae->work3,
                      batch, cur_h, cur_w, vae->num_groups, vae->eps);
     flux_copy(x, work, batch * mid_ch * cur_h * cur_w);
+    if (flux_vae_progress_callback)
+        flux_vae_progress_callback(progress++, total_blocks);
 
     int block_idx = 0;
     int up_idx = 0;
@@ -512,6 +526,8 @@ flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
             resblock_forward(work, x, block, vae->work3,
                              batch, cur_h, cur_w, vae->num_groups, vae->eps);
             flux_copy(x, work, batch * ch_out * cur_h * cur_w);
+            if (flux_vae_progress_callback)
+                flux_vae_progress_callback(progress++, total_blocks);
         }
 
         /* Upsample (except level 0) */

@@ -323,7 +323,7 @@ int main(int argc, char *argv[]) {
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
-            case 'v': output_level = OUTPUT_VERBOSE; break;
+            case 'v': output_level = OUTPUT_VERBOSE; flux_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
             case 'V':
                 fprintf(stderr, "FLUX.2 klein 4B v1.0.0\n");
