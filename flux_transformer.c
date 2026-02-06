@@ -2724,12 +2724,8 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     flux_gpu_tensor_t txt_shift2 = NULL, txt_scale2 = NULL, txt_gate2 = NULL;
     flux_gpu_tensor_t single_shift = NULL, single_scale = NULL, single_gate = NULL;
     flux_gpu_tensor_t final_shift = NULL, final_scale = NULL;
-    double double_start = 0.0;
-    double single_start = 0.0;
-    double final_start = 0.0;
-    double double_time = 0.0;
-    double single_time = 0.0;
-    double final_time = 0.0;
+    double step_start = 0.0;
+    double step_time = 0.0;
 
     if (!tf->img_in_weight_bf16 || !tf->txt_in_weight_bf16 ||
         !tf->final_proj_weight_bf16 || !tf->adaln_single_weight ||
@@ -2770,8 +2766,10 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         goto cleanup;
     }
 
-    /* Precompute modulation parameters */
-    double_start = tf_get_time_ms();
+    /* Precompute ALL modulation parameters on CPU before starting the GPU batch.
+     * All modulation only depends on t_emb_silu and fixed weight matrices,
+     * not on any GPU results, so we can compute everything upfront. */
+    step_start = tf_get_time_ms();
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
         tf->t_emb_silu[i] = x / (1.0f + expf(-x));
@@ -2780,7 +2778,33 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                        1, hidden, hidden * 6);
     flux_linear_nobias(tf->double_mod_txt, tf->t_emb_silu, tf->adaln_double_txt_weight,
                        1, hidden, hidden * 6);
+    int mod_size = hidden * 3;
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    float *mod_params = tf->work2 + total_seq * fused_dim;
+    flux_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+    float *final_mod = tf->double_mod_img;  /* Reuse buffer (double_mod_img not needed after its tensors are created) */
 
+    /* Pre-allocate all GPU buffers needed for the step */
+    concat_hidden = flux_gpu_tensor_alloc_f16((size_t)total_seq * hidden);
+    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
+    final_norm = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
+    if (!concat_hidden || !img_hidden_final || !final_norm) {
+        BF16_DEBUG("[BF16] failed to allocate step buffers\n");
+        goto cleanup;
+    }
+
+    single_block_bf16_scratch_t single_scratch;
+    int single_scratch_ok = single_block_bf16_scratch_init(&single_scratch, total_seq, hidden, mlp_hidden);
+    if (!single_scratch_ok) {
+        BF16_DEBUG("[BF16] failed to allocate single-block scratch tensors\n");
+        goto cleanup;
+    }
+
+    /* === MONOLITHIC GPU BATCH: all blocks + concat + slice + final in ONE command buffer ===
+     * This eliminates 4 waitUntilCompleted sync points per step (was 5 batches, now 1). */
+    flux_gpu_batch_begin();
+
+    /* Convert modulation params to bf16 GPU tensors (inside batch) */
     img_shift1 = bf16_tensor_from_f32(tf->double_mod_img, hidden);
     img_scale1 = bf16_tensor_from_f32(tf->double_mod_img + hidden, hidden);
     img_gate1 = bf16_tensor_from_f32(tf->double_mod_img + hidden * 2, hidden);
@@ -2795,15 +2819,20 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
     txt_scale2 = bf16_tensor_from_f32(tf->double_mod_txt + hidden * 4, hidden);
     txt_gate2 = bf16_tensor_from_f32(tf->double_mod_txt + hidden * 5, hidden);
 
+    single_shift = bf16_tensor_from_f32(mod_params, hidden);
+    single_scale = bf16_tensor_from_f32(mod_params + hidden, hidden);
+    single_gate = bf16_tensor_from_f32(mod_params + hidden * 2, hidden);
+
     if (!img_shift1 || !img_scale1 || !img_gate1 || !img_shift2 || !img_scale2 || !img_gate2 ||
-        !txt_shift1 || !txt_scale1 || !txt_gate1 || !txt_shift2 || !txt_scale2 || !txt_gate2) {
-        BF16_DEBUG("[BF16] failed to create double-block modulation tensors\n");
+        !txt_shift1 || !txt_scale1 || !txt_gate1 || !txt_shift2 || !txt_scale2 || !txt_gate2 ||
+        !single_shift || !single_scale || !single_gate) {
+        BF16_DEBUG("[BF16] failed to create modulation tensors\n");
+        flux_gpu_batch_end();
+        single_block_bf16_scratch_free(&single_scratch);
         goto cleanup;
     }
 
-    /* Double-stream blocks - batch ALL blocks together for minimal sync overhead.
-     * Weight buffers are cached in GPU memory, so safe to batch even with mmap. */
-    flux_gpu_batch_begin();
+    /* Double-stream blocks */
     for (int i = 0; i < tf->num_double_layers; i++) {
         if (tf->use_mmap) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
@@ -2820,55 +2849,19 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                        img_seq, txt_seq, tf)) {
             BF16_DEBUG("[BF16] double block %d failed\n", i);
             flux_gpu_batch_end();
+            single_block_bf16_scratch_free(&single_scratch);
             goto cleanup;
         }
         if (tf->use_mmap) {
             free_double_block_weights(&tf->double_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches.
-             * Each block has stable unique addresses in the mmap region.
-             * Cache entries persist and get reused on subsequent steps. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
     }
-    flux_gpu_batch_end();
-    double_time = tf_get_time_ms() - double_start;
-
     /* Concatenate text and image for single blocks */
-    concat_hidden = flux_gpu_tensor_alloc_f16((size_t)total_seq * hidden);
-    if (!concat_hidden) {
-        BF16_DEBUG("[BF16] failed to allocate concat_hidden\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
     flux_gpu_concat_seq_bf16(concat_hidden, txt_hidden, img_hidden, txt_seq, img_seq, hidden);
-    flux_gpu_batch_end();
 
-    /* Single-stream modulation */
-    single_start = tf_get_time_ms();
-    int mod_size = hidden * 3;
-    int fused_dim = hidden * 3 + mlp_hidden * 2;
-    float *mod_params = tf->work2 + total_seq * fused_dim;
-    flux_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
-    single_shift = bf16_tensor_from_f32(mod_params, hidden);
-    single_scale = bf16_tensor_from_f32(mod_params + hidden, hidden);
-    single_gate = bf16_tensor_from_f32(mod_params + hidden * 2, hidden);
-    if (!single_shift || !single_scale || !single_gate) {
-        BF16_DEBUG("[BF16] failed to create single-block modulation tensors\n");
-        goto cleanup;
-    }
-
-    /* Single block scratch buffers: re-used across all 20 blocks to avoid
-     * repeated large allocations/zeroing while in batch mode. */
-    single_block_bf16_scratch_t single_scratch;
-    int single_scratch_ok = single_block_bf16_scratch_init(&single_scratch, total_seq, hidden, mlp_hidden);
-    if (!single_scratch_ok) {
-        BF16_DEBUG("[BF16] failed to allocate single-block scratch tensors\n");
-        goto cleanup;
-    }
-
-    /* Single-stream blocks - batch ALL blocks together for minimal sync overhead. */
-    flux_gpu_batch_begin();
+    /* Single-stream blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
         if (tf->use_mmap) {
             load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
@@ -2896,44 +2889,25 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
 
         if (tf->use_mmap) {
             free_single_block_weights(&tf->single_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches. */
         }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
     }
-    flux_gpu_batch_end();
     single_block_bf16_scratch_free(&single_scratch);
-    single_time = tf_get_time_ms() - single_start;
 
-    /* Slice image portion for final layer.
-     * For text2img: extract_seq == img_seq (extract all image tokens)
-     * For img2img: extract_seq < img_seq (extract only target tokens, skip reference) */
-    img_hidden_final = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
-    if (!img_hidden_final) {
-        BF16_DEBUG("[BF16] failed to slice image hidden\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
+    /* Slice image portion for final layer */
     flux_gpu_slice_seq_bf16(img_hidden_final, concat_hidden, extract_seq, hidden, txt_seq);
-    flux_gpu_batch_end();
 
-    /* Final layer (bf16) */
-    final_start = tf_get_time_ms();
-    float *final_mod = tf->double_mod_img;
+    /* Final layer: compute modulation (reuse double_mod_img buffer, already consumed) */
     flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
     final_scale = bf16_tensor_from_f32(final_mod, hidden);
     final_shift = bf16_tensor_from_f32(final_mod + hidden, hidden);
     if (!final_scale || !final_shift) {
         BF16_DEBUG("[BF16] failed to create final modulation tensors\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
 
-    final_norm = flux_gpu_tensor_alloc_f16((size_t)extract_seq * hidden);
-    if (!final_norm) {
-        BF16_DEBUG("[BF16] failed to allocate final_norm\n");
-        goto cleanup;
-    }
-    flux_gpu_batch_begin();
     flux_gpu_adaln_norm_bf16(final_norm, img_hidden_final, final_shift, final_scale,
                              extract_seq, hidden, 1e-6f);
 
@@ -2941,18 +2915,18 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                               extract_seq, hidden, channels);
     if (!output_bf16) {
         BF16_DEBUG("[BF16] final projection failed\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
-    flux_gpu_batch_end();
 
     output_f32 = flux_gpu_tensor_bf16_to_f32(output_bf16);
     if (!output_f32) {
         BF16_DEBUG("[BF16] failed to convert output to f32\n");
+        flux_gpu_batch_end();
         goto cleanup;
     }
 
-    /* Ensure any queued GPU work is complete before reading back. */
-    flux_gpu_sync();
+    flux_gpu_batch_end();
 
     output_nlc = (float *)malloc((size_t)extract_seq * channels * sizeof(float));
     if (!output_nlc) {
@@ -2971,11 +2945,8 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
             output[c * extract_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    final_time = tf_get_time_ms() - final_start;
-    flux_timing_transformer_double += double_time;
-    flux_timing_transformer_single += single_time;
-    flux_timing_transformer_final += final_time;
-    flux_timing_transformer_total += double_time + single_time + final_time;
+    step_time = tf_get_time_ms() - step_start;
+    flux_timing_transformer_total += step_time;
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
 

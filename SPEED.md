@@ -29,27 +29,23 @@
 
 ### 256x256 (seq=256+512=768 tokens)
 - Text encoding: 1.9s (Qwen3, cached on 2nd run) — 11.8s cold start
-- Denoising total: 2172 ms (4 steps)
-  - Step 1: 636 ms, Steps 2-4: ~512 ms each
-  - Double blocks: ~520 ms (25%), Single blocks: ~1560 ms (75%)
+- Denoising total: 2073 ms (4 steps)
+  - Step 1: ~570 ms, Steps 2-4: ~500 ms each
 - VAE decode: 0.4s
 - Transformer loading: 1.3s (includes bf16 weight cache warmup)
-- **Total: ~6.0s (cold text encoder), ~4.4s (warm)**
+- **Total: ~5.9s (cold text encoder), ~4.3s (warm)**
 
 ### 512x512 (seq=1024+512=1536 tokens)
 - Text encoding: 1.9s
-- Denoising total: 4146 ms (4 steps)
-  - Step 1: 1129 ms, Steps 2-4: ~1006 ms each
-  - Double blocks: ~930 ms (23%), Single blocks: ~3120 ms (77%)
+- Denoising total: 4004 ms (4 steps)
+  - Step 1: ~1058 ms, Steps 2-4: ~980 ms each
 - VAE decode: 1.6s
-- **Total: ~9.3s**
+- **Total: ~9.1s**
 
 ### Key observations
-- Step 1 is ~1.2x slower than subsequent steps (residual MPS warmup)
-- Single blocks dominate (75-77% of denoising time)
-- 20 single blocks vs 5 double blocks, so per-block: single ~78ms, double ~26ms (256x256)
-- Each block does: batch_begin → ~12 GPU ops → batch_end → tensor_read (CPU sync)
-- 25 blocks × 4 steps = 100 command buffer round-trips per generation
+- Monolithic GPU batch: 1 command buffer per step (all 25 blocks + concat + slice + final)
+- Step 1 ~15% slower than subsequent steps (residual MPS warmup)
+- Matmul compute dominates (~4.5 TFLOPS for these dimensions)
 
 ## Already Optimized
 - Batched GPU ops within each block (batch_begin/batch_end)
@@ -77,6 +73,28 @@
 - Created graphs for 9 linear ops + 3 SDPA ops per resolution, allocated dummy Metal buffers
 - Total JIT warmup: only ~80ms (MPSGraph compiles fast on M3 Max)
 - **Result: no improvement — JIT compilation was not the bottleneck. Reverted.**
+
+### Attempt 1c: Pre-compute QK norm GPU tensors (FAILED)
+- Tried pre-computing norm_q/norm_k bf16 GPU tensors at weight load time
+- Eliminates 60 `bf16_tensor_from_f32` calls per step (20 single × 2 + 5 double × 4)
+- Each call converts 128 floats (512 bytes) — tiny tensors
+- **Result: no measurable improvement. Within batch, the per-dispatch overhead is negligible. Reverted.**
+
+### Attempt 2: Monolithic GPU batch (SUCCESS)
+- Previously: 5 separate batch_begin/batch_end per step (double blocks → concat → single blocks → slice → final)
+- Each batch_end = [cmd commit] + [waitUntilCompleted] = GPU pipeline flush + CPU-GPU sync
+- Key insight: ALL CPU modulation computations depend only on t_emb_silu + fixed weights, NOT on GPU results
+- Precompute all modulation parameters at the start (double, single, final), pre-allocate all buffers
+- Then run EVERYTHING in a single command buffer: double blocks + concat + single blocks + slice + final + bf16→f32
+- Command buffer round-trips per step: 5 → 1 (eliminates 4 waitUntilCompleted syncs)
+- Per-stage timing breakdown removed for bf16 path (all work in one batch, can't measure stages)
+- **Result: 256x256 denoising 2172 → 2073ms (4.6% faster), 512x512 4146 → 4004ms (3.4% faster)**
+- **Cumulative: 256x256 2822 → 2073ms (27% faster), 512x512 4420 → 4004ms (9% faster)**
+
+### Next targets
+- 256x256: ~2073ms denoising — steady-state steps ~500ms, step 1 ~570ms
+- 512x512: ~4004ms denoising — steady-state steps ~980ms, step 1 ~1058ms
+- Remaining overhead: matmul compute dominates. MPS matmul at ~4.5 TFLOPS for these dimensions.
 
 ## Credits attribution rules
 - Ideas / kernels / approaches should be only taken from BSD / MIT licensed code.
