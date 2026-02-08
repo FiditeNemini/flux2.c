@@ -82,6 +82,8 @@ static double tf_get_time_ms(void) {
 #else
 #include <cblas.h>
 #endif
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
 /* Use Metal for GPU acceleration when available */
@@ -1292,6 +1294,105 @@ static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
     return 0;
 }
 
+/* ========================================================================
+ * Thread-parallel attention for BLAS path.
+ * Per-head sgemm is too small for BLAS internal threading, so we
+ * parallelize across heads using pthreads instead.
+ * ======================================================================== */
+
+#ifdef USE_BLAS
+/* Work descriptor for self-attention (single blocks) */
+typedef struct {
+    const float *q, *k, *v;
+    float *out, *scores;
+    int seq, head_dim, hidden;
+    float scale;
+    int head_start, head_end;
+} mha_thread_work_t;
+
+static void *mha_thread_worker(void *arg) {
+    mha_thread_work_t *w = (mha_thread_work_t *)arg;
+    for (int h = w->head_start; h < w->head_end; h++) {
+        const float *qh = w->q + h * w->head_dim;
+        const float *kh = w->k + h * w->head_dim;
+        const float *vh = w->v + h * w->head_dim;
+        float *oh = w->out + h * w->head_dim;
+        float *sh = w->scores + (size_t)h * w->seq * w->seq;
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->seq, w->seq, w->head_dim,
+                    w->scale, qh, w->hidden, kh, w->hidden,
+                    0.0f, sh, w->seq);
+        flux_softmax(sh, w->seq, w->seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->seq, w->head_dim, w->seq,
+                    1.0f, sh, w->seq, vh, w->hidden,
+                    0.0f, oh, w->hidden);
+    }
+    return NULL;
+}
+
+/* Work descriptor for joint attention (double blocks) */
+typedef struct {
+    const float *img_q, *txt_q, *cat_k, *cat_v;
+    float *img_out, *txt_out, *scores;
+    int img_seq, txt_seq, total_seq, head_dim, hidden;
+    float scale;
+    int head_start, head_end;
+} joint_attn_thread_work_t;
+
+static void *joint_attn_thread_worker(void *arg) {
+    joint_attn_thread_work_t *w = (joint_attn_thread_work_t *)arg;
+    for (int h = w->head_start; h < w->head_end; h++) {
+        const float *img_qh = w->img_q + h * w->head_dim;
+        const float *txt_qh = w->txt_q + h * w->head_dim;
+        const float *kh = w->cat_k + h * w->head_dim;
+        const float *vh = w->cat_v + h * w->head_dim;
+        float *img_oh = w->img_out + h * w->head_dim;
+        float *txt_oh = w->txt_out + h * w->head_dim;
+        float *img_sh = w->scores + (size_t)h * w->total_seq * w->total_seq;
+        float *txt_sh = img_sh + (size_t)w->img_seq * w->total_seq;
+
+        /* Image attention */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->img_seq, w->total_seq, w->head_dim,
+                    w->scale, img_qh, w->hidden, kh, w->hidden,
+                    0.0f, img_sh, w->total_seq);
+        flux_softmax(img_sh, w->img_seq, w->total_seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->img_seq, w->head_dim, w->total_seq,
+                    1.0f, img_sh, w->total_seq, vh, w->hidden,
+                    0.0f, img_oh, w->hidden);
+
+        /* Text attention */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    w->txt_seq, w->total_seq, w->head_dim,
+                    w->scale, txt_qh, w->hidden, kh, w->hidden,
+                    0.0f, txt_sh, w->total_seq);
+        flux_softmax(txt_sh, w->txt_seq, w->total_seq);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    w->txt_seq, w->head_dim, w->total_seq,
+                    1.0f, txt_sh, w->total_seq, vh, w->hidden,
+                    0.0f, txt_oh, w->hidden);
+    }
+    return NULL;
+}
+
+/* Get number of threads for head-parallel attention.
+ * Uses CPU core count, capped to divide num_heads evenly. */
+static int get_attn_num_threads(int heads) {
+    static int cached = 0;
+    if (cached) return cached;
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 2) { cached = 1; return 1; }
+    if (ncpu > heads) ncpu = heads;
+    /* Round down to divide heads evenly */
+    while (heads % ncpu != 0) ncpu--;
+    cached = ncpu;
+    return cached;
+}
+#endif /* USE_BLAS */
+
 /* Multi-head attention with BLAS optimization
  * Uses pre-allocated workspace buffers from transformer struct
  */
@@ -1332,34 +1433,53 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: strided per-head attention without transposes.
+    /* BLAS path: thread-parallel per-head attention.
      * Q, K, V are [seq, heads*head_dim] layout. We use lda=hidden to stride
-     * over heads, reading head_dim elements per row directly. */
+     * over heads, reading head_dim elements per row directly.
+     * Per-head sgemm is too small for BLAS internal threading, so we
+     * parallelize across heads with pthreads for better core utilization. */
     {
         int hidden = tf->num_heads * head_dim;
         float *scores = tf->attn_scores;
+        int nthreads = get_attn_num_threads(tf->num_heads);
+        int heads_per_thread = tf->num_heads / nthreads;
 
-        for (int h = 0; h < tf->num_heads; h++) {
-            const float *qh = q + h * head_dim;
-            const float *kh = k + h * head_dim;
-            const float *vh = v + h * head_dim;
-            float *oh = out + h * head_dim;
-            float *sh = scores + h * seq * seq;
+        if (nthreads <= 1) {
+            /* Serial fallback */
+            for (int h = 0; h < tf->num_heads; h++) {
+                const float *qh = q + h * head_dim;
+                const float *kh = k + h * head_dim;
+                const float *vh = v + h * head_dim;
+                float *oh = out + h * head_dim;
+                float *sh = scores + (size_t)h * seq * seq;
 
-            /* scores = Q_h @ K_h^T, strided reads with lda=hidden */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        seq, seq, head_dim,
-                        scale, qh, hidden, kh, hidden,
-                        0.0f, sh, seq);
-
-            /* Softmax over scores */
-            flux_softmax(sh, seq, seq);
-
-            /* out_h = scores @ V_h, strided read and write */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        seq, head_dim, seq,
-                        1.0f, sh, seq, vh, hidden,
-                        0.0f, oh, hidden);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            seq, seq, head_dim,
+                            scale, qh, hidden, kh, hidden,
+                            0.0f, sh, seq);
+                flux_softmax(sh, seq, seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq, head_dim, seq,
+                            1.0f, sh, seq, vh, hidden,
+                            0.0f, oh, hidden);
+            }
+        } else {
+            pthread_t threads[nthreads];
+            mha_thread_work_t work[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                work[t] = (mha_thread_work_t){
+                    .q = q, .k = k, .v = v,
+                    .out = out, .scores = scores,
+                    .seq = seq, .head_dim = head_dim, .hidden = hidden,
+                    .scale = scale,
+                    .head_start = t * heads_per_thread,
+                    .head_end = (t + 1) * heads_per_thread,
+                };
+                pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]);
+            }
+            for (int t = 0; t < nthreads; t++) {
+                pthread_join(threads[t], NULL);
+            }
         }
     }
 #else
@@ -1435,42 +1555,67 @@ static void joint_attention(float *img_out, float *txt_out,
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: strided per-head attention without transposes.
-     * All tensors are [seq, heads*head_dim] layout, use lda=hidden for strides. */
+    /* BLAS path: thread-parallel per-head joint attention.
+     * All tensors are [seq, heads*head_dim] layout, use lda=hidden for strides.
+     * Each head gets its own scores slice for thread safety. */
     {
         float *scores = tf->attn_scores;
+        int nthreads = get_attn_num_threads(heads);
+        int heads_per_thread = heads / nthreads;
 
-        for (int h = 0; h < heads; h++) {
-            const float *img_qh = img_q + h * head_dim;
-            const float *txt_qh = txt_q + h * head_dim;
-            const float *kh = cat_k + h * head_dim;
-            const float *vh = cat_v + h * head_dim;
-            float *img_oh = img_out + h * head_dim;
-            float *txt_oh = txt_out + h * head_dim;
-            float *img_sh = scores;  /* Reuse scores buffer */
-            float *txt_sh = scores + img_seq * total_seq;
+        if (nthreads <= 1) {
+            /* Serial fallback */
+            for (int h = 0; h < heads; h++) {
+                const float *img_qh = img_q + h * head_dim;
+                const float *txt_qh = txt_q + h * head_dim;
+                const float *kh = cat_k + h * head_dim;
+                const float *vh = cat_v + h * head_dim;
+                float *img_oh = img_out + h * head_dim;
+                float *txt_oh = txt_out + h * head_dim;
+                float *img_sh = scores + (size_t)h * total_seq * total_seq;
+                float *txt_sh = img_sh + (size_t)img_seq * total_seq;
 
-            /* Image attention: img_Q @ cat_K^T */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        img_seq, total_seq, head_dim,
-                        scale, img_qh, hidden, kh, hidden,
-                        0.0f, img_sh, total_seq);
-            flux_softmax(img_sh, img_seq, total_seq);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        img_seq, head_dim, total_seq,
-                        1.0f, img_sh, total_seq, vh, hidden,
-                        0.0f, img_oh, hidden);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            img_seq, total_seq, head_dim,
+                            scale, img_qh, hidden, kh, hidden,
+                            0.0f, img_sh, total_seq);
+                flux_softmax(img_sh, img_seq, total_seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            img_seq, head_dim, total_seq,
+                            1.0f, img_sh, total_seq, vh, hidden,
+                            0.0f, img_oh, hidden);
 
-            /* Text attention: txt_Q @ cat_K^T */
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        txt_seq, total_seq, head_dim,
-                        scale, txt_qh, hidden, kh, hidden,
-                        0.0f, txt_sh, total_seq);
-            flux_softmax(txt_sh, txt_seq, total_seq);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        txt_seq, head_dim, total_seq,
-                        1.0f, txt_sh, total_seq, vh, hidden,
-                        0.0f, txt_oh, hidden);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            txt_seq, total_seq, head_dim,
+                            scale, txt_qh, hidden, kh, hidden,
+                            0.0f, txt_sh, total_seq);
+                flux_softmax(txt_sh, txt_seq, total_seq);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            txt_seq, head_dim, total_seq,
+                            1.0f, txt_sh, total_seq, vh, hidden,
+                            0.0f, txt_oh, hidden);
+            }
+        } else {
+            pthread_t threads[nthreads];
+            joint_attn_thread_work_t work[nthreads];
+            for (int t = 0; t < nthreads; t++) {
+                work[t] = (joint_attn_thread_work_t){
+                    .img_q = img_q, .txt_q = txt_q,
+                    .cat_k = cat_k, .cat_v = cat_v,
+                    .img_out = img_out, .txt_out = txt_out,
+                    .scores = scores,
+                    .img_seq = img_seq, .txt_seq = txt_seq,
+                    .total_seq = total_seq,
+                    .head_dim = head_dim, .hidden = hidden,
+                    .scale = scale,
+                    .head_start = t * heads_per_thread,
+                    .head_end = (t + 1) * heads_per_thread,
+                };
+                pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]);
+            }
+            for (int t = 0; t < nthreads; t++) {
+                pthread_join(threads[t], NULL);
+            }
         }
     }
 #else
