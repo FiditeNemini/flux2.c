@@ -1775,9 +1775,8 @@ static void swiglu_ffn_bf16(float *out, const float *x,
     LINEAR_BF16_OR_F32(up, x, up_weight, up_weight_bf16, seq, hidden, mlp_hidden);
     flux_gpu_end_batch();
 
-    /* SiLU(gate) * up */
-    flux_silu(gate, seq * mlp_hidden);
-    flux_mul_inplace(gate, up, seq * mlp_hidden);
+    /* SiLU(gate) * up - fused for better performance */
+    flux_silu_mul(gate, up, seq * mlp_hidden);
 
     /* Down projection */
     LINEAR_BF16_OR_F32(out, gate, down_weight, down_weight_bf16, seq, mlp_hidden, hidden);
@@ -3118,9 +3117,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     double _t5 = prof_get_time();
     prof_single_attention += _t5 - _t4;
 
-    /* SwiGLU: silu(gate) * up */
-    flux_silu(mlp_gate, seq * mlp_hidden);
-    flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
+    /* SwiGLU: silu(gate) * up - fused for better performance */
+    flux_silu_mul(mlp_gate, mlp_up, seq * mlp_hidden);
 
     double _t6 = prof_get_time();
     prof_single_swiglu += _t6 - _t5;

@@ -134,6 +134,9 @@ void flux_batch_norm(float *out, const float *x,
 /* SiLU / Swish activation: x * sigmoid(x) */
 void flux_silu(float *x, int n);
 
+/* Fused SiLU(gate) * up - single pass for SwiGLU */
+void flux_silu_mul(float *gate, const float *up, int n);
+
 /* Softmax over last dimension */
 void flux_softmax(float *x, int rows, int cols);
 
