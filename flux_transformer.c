@@ -618,6 +618,11 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
 /* Free weights for a single double_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_double_block_weights(double_block_t *b) {
+#ifdef USE_METAL
+    /* Invalidate GPU weight cache before freeing CPU pointers.
+     * malloc can reuse freed addresses, causing stale cache hits. */
+    flux_metal_clear_weight_cache_only();
+#endif
     free(b->img_norm_q_weight); b->img_norm_q_weight = NULL;
     free(b->img_norm_k_weight); b->img_norm_k_weight = NULL;
     free(b->img_q_weight); b->img_q_weight = NULL;
@@ -682,6 +687,9 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t **fil
 /* Free weights for a single single_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_single_block_weights(single_block_t *b) {
+#ifdef USE_METAL
+    flux_metal_clear_weight_cache_only();
+#endif
     free(b->norm_q_weight); b->norm_q_weight = NULL;
     free(b->norm_k_weight); b->norm_k_weight = NULL;
     free(b->qkv_mlp_weight); b->qkv_mlp_weight = NULL;
