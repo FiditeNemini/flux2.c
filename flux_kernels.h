@@ -156,6 +156,7 @@ void flux_silu_mul(float *gate, const float *up, int n);
 
 /* Softmax over last dimension */
 void flux_softmax(float *x, int rows, int cols);
+void flux_softmax_cpu(float *x, int rows, int cols);
 
 /* ========================================================================
  * Attention Operations

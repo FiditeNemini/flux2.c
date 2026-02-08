@@ -598,16 +598,8 @@ void flux_silu_mul(float *gate, const float *up, int n) {
     }
 }
 
-void flux_softmax(float *x, int rows, int cols) {
-#ifdef USE_METAL
-    /* Use GPU only for very large softmax operations
-     * Sync overhead usually dominates for smaller ops */
-    if (flux_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
-        flux_metal_softmax(x, rows, cols);
-        return;
-    }
-#endif
-
+/* CPU-only softmax. Safe to call from worker threads (no Metal dispatch). */
+void flux_softmax_cpu(float *x, int rows, int cols) {
     for (int r = 0; r < rows; r++) {
         float *row = x + r * cols;
 
@@ -630,6 +622,18 @@ void flux_softmax(float *x, int rows, int cols) {
             row[c] *= inv_sum;
         }
     }
+}
+
+void flux_softmax(float *x, int rows, int cols) {
+#ifdef USE_METAL
+    /* Use GPU only for very large softmax operations
+     * Sync overhead usually dominates for smaller ops */
+    if (flux_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {
+        flux_metal_softmax(x, rows, cols);
+        return;
+    }
+#endif
+    flux_softmax_cpu(x, rows, cols);
 }
 
 /* ========================================================================

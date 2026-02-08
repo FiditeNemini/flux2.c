@@ -1323,7 +1323,7 @@ static void *mha_thread_worker(void *arg) {
                     w->seq, w->seq, w->head_dim,
                     w->scale, qh, w->hidden, kh, w->hidden,
                     0.0f, sh, w->seq);
-        flux_softmax(sh, w->seq, w->seq);
+        flux_softmax_cpu(sh, w->seq, w->seq);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     w->seq, w->head_dim, w->seq,
                     1.0f, sh, w->seq, vh, w->hidden,
@@ -1358,7 +1358,7 @@ static void *joint_attn_thread_worker(void *arg) {
                     w->img_seq, w->total_seq, w->head_dim,
                     w->scale, img_qh, w->hidden, kh, w->hidden,
                     0.0f, img_sh, w->total_seq);
-        flux_softmax(img_sh, w->img_seq, w->total_seq);
+        flux_softmax_cpu(img_sh, w->img_seq, w->total_seq);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     w->img_seq, w->head_dim, w->total_seq,
                     1.0f, img_sh, w->total_seq, vh, w->hidden,
@@ -1369,7 +1369,7 @@ static void *joint_attn_thread_worker(void *arg) {
                     w->txt_seq, w->total_seq, w->head_dim,
                     w->scale, txt_qh, w->hidden, kh, w->hidden,
                     0.0f, txt_sh, w->total_seq);
-        flux_softmax(txt_sh, w->txt_seq, w->total_seq);
+        flux_softmax_cpu(txt_sh, w->txt_seq, w->total_seq);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     w->txt_seq, w->head_dim, w->total_seq,
                     1.0f, txt_sh, w->total_seq, vh, w->hidden,
@@ -1466,6 +1466,7 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
         } else {
             pthread_t threads[nthreads];
             mha_thread_work_t work[nthreads];
+            int ok[nthreads];
             for (int t = 0; t < nthreads; t++) {
                 work[t] = (mha_thread_work_t){
                     .q = q, .k = k, .v = v,
@@ -1475,10 +1476,11 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
                     .head_start = t * heads_per_thread,
                     .head_end = (t + 1) * heads_per_thread,
                 };
-                pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]);
+                ok[t] = pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]) == 0;
+                if (!ok[t]) mha_thread_worker(&work[t]);
             }
             for (int t = 0; t < nthreads; t++) {
-                pthread_join(threads[t], NULL);
+                if (ok[t]) pthread_join(threads[t], NULL);
             }
         }
     }
@@ -1598,6 +1600,7 @@ static void joint_attention(float *img_out, float *txt_out,
         } else {
             pthread_t threads[nthreads];
             joint_attn_thread_work_t work[nthreads];
+            int ok[nthreads];
             for (int t = 0; t < nthreads; t++) {
                 work[t] = (joint_attn_thread_work_t){
                     .img_q = img_q, .txt_q = txt_q,
@@ -1611,10 +1614,11 @@ static void joint_attention(float *img_out, float *txt_out,
                     .head_start = t * heads_per_thread,
                     .head_end = (t + 1) * heads_per_thread,
                 };
-                pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]);
+                ok[t] = pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]) == 0;
+                if (!ok[t]) joint_attn_thread_worker(&work[t]);
             }
             for (int t = 0; t < nthreads; t++) {
-                pthread_join(threads[t], NULL);
+                if (ok[t]) pthread_join(threads[t], NULL);
             }
         }
     }
@@ -4368,6 +4372,13 @@ error:
 void flux_transformer_free(flux_transformer_t *tf) {
     if (!tf) return;
 
+    /* In mmap mode, bf16 pointers point into the mmap'd file region and must
+     * NOT be freed. Clean up any cached block weights first, then only NULL
+     * the bf16 pointers (don't free them). */
+    if (tf->use_mmap) {
+        flux_transformer_free_mmap_cache(tf);
+    }
+
     free(tf->img_in_weight);
     free(tf->txt_in_weight);
     free(tf->img_in_weight_bf16);
@@ -4383,33 +4394,35 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->img_q_weight);
             free(b->img_k_weight);
             free(b->img_v_weight);
-            free(b->img_q_weight_bf16);
-            free(b->img_k_weight_bf16);
-            free(b->img_v_weight_bf16);
             free(b->img_proj_weight);
-            free(b->img_proj_weight_bf16);
             free(b->img_mlp_gate_weight);
             free(b->img_mlp_up_weight);
             free(b->img_mlp_down_weight);
-            free(b->img_mlp_gate_weight_bf16);
-            free(b->img_mlp_up_weight_bf16);
-            free(b->img_mlp_down_weight_bf16);
             free(b->txt_norm_q_weight);
             free(b->txt_norm_k_weight);
             free(b->txt_q_weight);
             free(b->txt_k_weight);
             free(b->txt_v_weight);
-            free(b->txt_q_weight_bf16);
-            free(b->txt_k_weight_bf16);
-            free(b->txt_v_weight_bf16);
             free(b->txt_proj_weight);
-            free(b->txt_proj_weight_bf16);
             free(b->txt_mlp_gate_weight);
             free(b->txt_mlp_up_weight);
             free(b->txt_mlp_down_weight);
-            free(b->txt_mlp_gate_weight_bf16);
-            free(b->txt_mlp_up_weight_bf16);
-            free(b->txt_mlp_down_weight_bf16);
+            if (!tf->use_mmap) {
+                free(b->img_q_weight_bf16);
+                free(b->img_k_weight_bf16);
+                free(b->img_v_weight_bf16);
+                free(b->img_proj_weight_bf16);
+                free(b->img_mlp_gate_weight_bf16);
+                free(b->img_mlp_up_weight_bf16);
+                free(b->img_mlp_down_weight_bf16);
+                free(b->txt_q_weight_bf16);
+                free(b->txt_k_weight_bf16);
+                free(b->txt_v_weight_bf16);
+                free(b->txt_proj_weight_bf16);
+                free(b->txt_mlp_gate_weight_bf16);
+                free(b->txt_mlp_up_weight_bf16);
+                free(b->txt_mlp_down_weight_bf16);
+            }
         }
         free(tf->double_blocks);
     }
@@ -4420,9 +4433,11 @@ void flux_transformer_free(flux_transformer_t *tf) {
             free(b->norm_q_weight);
             free(b->norm_k_weight);
             free(b->qkv_mlp_weight);
-            free(b->qkv_mlp_weight_bf16);
             free(b->proj_mlp_weight);
-            free(b->proj_mlp_weight_bf16);
+            if (!tf->use_mmap) {
+                free(b->qkv_mlp_weight_bf16);
+                free(b->proj_mlp_weight_bf16);
+            }
         }
         free(tf->single_blocks);
     }
