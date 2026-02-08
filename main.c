@@ -262,6 +262,13 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
+    if (flux_metal_available()) {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        char cpu_brand[128] = "Apple Silicon";
+        size_t len = sizeof(cpu_brand);
+        sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
+        fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
+    }
 #elif defined(USE_BLAS)
     /* BLAS banner printed after option parsing (--blas-threads may change it) */
 #else

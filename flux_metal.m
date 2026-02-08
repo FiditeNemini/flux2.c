@@ -462,9 +462,6 @@ int flux_metal_init(void) {
         memset(g_weight_cache, 0, sizeof(g_weight_cache));
 
         g_initialized = 1;
-        if (flux_verbose)
-            fprintf(stderr, "Metal: GPU acceleration enabled (%s)\n",
-                    [[g_device name] UTF8String]);
 
         /* Load compute shaders (high thresholds keep them dormant for small ops) */
         flux_metal_init_shaders();
