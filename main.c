@@ -262,17 +262,6 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
-    if (flux_metal_available()) {
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        char cpu_brand[128] = "Apple Silicon";
-        size_t len = sizeof(cpu_brand);
-        sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
-        fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
-    }
-#elif defined(USE_BLAS)
-    /* BLAS banner printed after option parsing (--blas-threads may change it) */
-#else
-    fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
 #endif
 
     /* Command line options */
@@ -380,29 +369,43 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* BLAS: set threads and print banner */
-#ifdef USE_BLAS
-#ifndef USE_METAL
-    {
+    /* BLAS: apply thread setting regardless of quiet mode */
+#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
+    if (blas_threads > 0) openblas_set_num_threads(blas_threads);
+#endif
+
+    /* Backend banner (suppressed by --quiet) */
+    if (output_level != OUTPUT_QUIET) {
+#ifdef USE_METAL
+        if (flux_metal_available()) {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            char cpu_brand[128] = "Apple Silicon";
+            size_t len = sizeof(cpu_brand);
+            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
+            fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
+        }
+#elif defined(USE_BLAS)
 #ifdef __APPLE__
-        char cpu_brand[128] = "Apple Silicon";
-        size_t len = sizeof(cpu_brand);
-        sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        fprintf(stderr, "BLAS: Accelerate | %s | %ld cores\n", cpu_brand, ncpu);
-        if (blas_threads > 0)
-            fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
+        {
+            char cpu_brand[128] = "Apple Silicon";
+            size_t len = sizeof(cpu_brand);
+            sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            fprintf(stderr, "BLAS: Accelerate | %s | %ld cores\n", cpu_brand, ncpu);
+            if (blas_threads > 0)
+                fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
+        }
 #else
-        if (blas_threads > 0) openblas_set_num_threads(blas_threads);
         fprintf(stderr, "BLAS: OpenBLAS | %s | %d threads / %d procs\n",
                 openblas_get_corename(),
                 openblas_get_num_threads(),
                 openblas_get_num_procs());
         fprintf(stderr, "      %s\n", openblas_get_config());
 #endif
+#else
+        fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
+#endif
     }
-#endif
-#endif
 
     /* Validate required arguments */
     if (!model_dir) {
@@ -502,7 +505,8 @@ int main(int argc, char *argv[]) {
     LOG_NORMAL("Model: %s\n", flux_model_info(ctx));
 
     /* Non-commercial license warning for 9B model */
-    if (flux_is_non_commercial(ctx) && !no_license_info) {
+    if (flux_is_non_commercial(ctx) && !no_license_info
+        && output_level != OUTPUT_QUIET) {
         fprintf(stderr,
             "\nNOTE: This model is released under a NON COMMERCIAL LICENSE.\n"
             "The output can only be used under the terms of the\n"
